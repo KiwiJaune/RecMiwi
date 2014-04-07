@@ -368,40 +368,7 @@ ENC_CS_TRIS = 0;
 
 	while(1)
     {
-		if(!jackRetire && JACK)
-		{
-			jackRetire = 1;
-			trame.nbChar = 2;
-			mess[0] = 0xC2;
-			mess[1] = 0x52;
-			trame.message = mess;
-
-			EnvoiUserUdp(trame);
-		}
-
-		mesureCapteur = PORTAbits.RA0;
-		if(!capteurEvitementPrec && mesureCapteur)
-		{
-			trame.nbChar = 2;
-			mess[0] = 0xC2;
-			mess[1] = 0x78;
-			trame.message = mess;
-
-			EnvoiUserUdp(trame);
-
-			capteurEvitementPrec = mesureCapteur;
-		}
-
-		if(capteurEvitementPrec && !mesureCapteur)
-		{
-			trame.nbChar = 2;
-			mess[0] = 0xC2;
-			mess[1] = 0x79;
-			trame.message = mess;
-
-			EnvoiUserUdp(trame);
-			capteurEvitementPrec = mesureCapteur;
-		}
+		
 		
         // Blink LED0 (right most one) every second.
         if(TickGet() - t >= TICK_SECOND/2ul)
@@ -423,7 +390,9 @@ ENC_CS_TRIS = 0;
 		if(trame.nbChar != 0)
 		{
 			AnalyseTrame(trame);
-			EnvoiUserUdp(trame);
+
+			if(trame.message[1] != 0xA0)
+				EnvoiUserUdp(trame);
 			// Données reçus en UDP
 		}		
 					
