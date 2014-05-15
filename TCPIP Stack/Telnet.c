@@ -62,34 +62,46 @@
 // Set up configuration parameter defaults if not overridden in 
 // TCPIPConfig.h
 #if !defined(TELNET_PORT)
-	#define TELNET_PORT			23	// Unsecured Telnet port
+    // Unsecured Telnet port
+	#define TELNET_PORT			23
 #endif
 #if !defined(TELNETS_PORT)	
-	#define TELNETS_PORT		992	// SSL Secured Telnet port (ignored if STACK_USE_SSL_SERVER is undefined)
+    // SSL Secured Telnet port (ignored if STACK_USE_SSL_SERVER is undefined)
+	#define TELNETS_PORT		992	
 #endif
 #if !defined(MAX_TELNET_CONNECTIONS)
+    // Maximum number of Telnet connections
 	#define MAX_TELNET_CONNECTIONS	(3u)
 #endif
 #if !defined(TELNET_USERNAME)
+    // Default Telnet user name
 	#define TELNET_USERNAME		"admin"
 #endif
 #if !defined(TELNET_PASSWORD)
+    // Default Telnet password
 	#define TELNET_PASSWORD		"microchip"
 #endif
 
+// Demo title string
 static ROM BYTE strTitle[]			= "\x1b[2J\x1b[31m\x1b[1m"	// 2J is clear screen, 31m is red, 1m is bold
 									  "Microchip Telnet Server 1.1\x1b[0m\r\n"	// 0m is clear all attributes
 									  "(for this demo, type 'admin' for the login and 'microchip' for the password.)\r\n"
 								  	  "Login: ";
+// Demo password
 static ROM BYTE strPassword[]		= "Password: \xff\xfd\x2d";	// DO Suppress Local Echo (stop telnet client from printing typed characters)
+// Access denied message
 static ROM BYTE strAccessDenied[]	= "\r\nAccess denied\r\n\r\n";
+// Successful authentication message
 static ROM BYTE strAuthenticated[]	= "\r\nLogged in successfully\r\n\r\n"
 									  "\r\nPress 'q' to quit\r\n";
+// Demo output string
 static ROM BYTE strDisplay[]		= "\r\nSNTP Time:    (disabled)"
 									  "\r\nAnalog:             1023"
 									  "\r\nButtons:         3 2 1 0"
 									  "\r\nLEDs:    7 6 5 4 3 2 1 0";
+// String with extra spaces, for Demo
 static ROM BYTE strSpaces[]			= "          ";
+// Demo disconnection message
 static ROM BYTE strGoodBye[]		= "\r\n\r\nGoodbye!\r\n";
 
 extern BYTE AN0String[8];
@@ -105,7 +117,9 @@ extern BYTE AN0String[8];
  *
  * Side Effects:    None
  *
- * Overview:        None
+ * Overview:        Performs Telnet Server related tasks.  Contains
+ *                  the Telnet state machine and state tracking
+ *                  variables.
  *
  * Note:            None
  ********************************************************************/
@@ -226,7 +240,7 @@ void TelnetTask(void)
 			
 				// Search for the username -- case insensitive
 				w2 = TCPFindROMArray(MySocket, (ROM BYTE*)TELNET_USERNAME, sizeof(TELNET_USERNAME)-1, 0, TRUE);
-				if((w2 != 0u) || !((sizeof(TELNET_USERNAME)-1 == w) || (sizeof(TELNET_USERNAME) == w)))
+				if( !((sizeof(TELNET_USERNAME)-1 == w - w2) || (sizeof(TELNET_USERNAME) == w - w2)))
 				{
 					// Did not find the username, but let's pretend we did so we don't leak the user name validity
 					TelnetState = SM_GET_PASSWORD_BAD_LOGIN;	
@@ -265,7 +279,8 @@ void TelnetTask(void)
 	
 				// Search for the password -- case sensitive
 				w2 = TCPFindROMArray(MySocket, (ROM BYTE*)TELNET_PASSWORD, sizeof(TELNET_PASSWORD)-1, 0, FALSE);
-				if((w2 != 3u) || !((sizeof(TELNET_PASSWORD)-1 == w-3) || (sizeof(TELNET_PASSWORD) == w-3)) || (TelnetState == SM_GET_PASSWORD_BAD_LOGIN))
+				if(!((sizeof(TELNET_PASSWORD) == w - w2) || (sizeof(TELNET_PASSWORD) - 1 == w - w2)) 
+					|| (TelnetState == SM_GET_PASSWORD_BAD_LOGIN))
 				{
 					// Did not find the password
 					TelnetState = SM_PRINT_LOGIN;	

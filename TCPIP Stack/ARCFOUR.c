@@ -52,10 +52,6 @@
  * various third parties.  It is your responsibility to obtain 
  * information regarding any applicable licensing obligations.
  *
- *
- * Author               Date		Comment
- *~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- * Elliott Wood	        2/27/07		Original
  ********************************************************************/
 #define __ARCFOUR_C
 

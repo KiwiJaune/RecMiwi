@@ -80,23 +80,24 @@
 
 
 // Pseudo Functions - these should not need changing unless porting to a new 
-// processor type or speed
-#define DelaySetupHold()		do{Nop();}while(0)
+// processor type or speed.
+// DelaySetupHold() should wait at least 75ns to meet Tpsp2 (RD to Data Valid)
+#define DelaySetupHold()		do{Nop();Nop();}while(0)
 #if (GetInstructionClock() > 16000000ul)
-	#undef DelaySetupHold
-	#define DelaySetupHold()	do{Nop();Nop();}while(0)
-#endif
-#if (GetInstructionClock() > 32000000ul)
 	#undef DelaySetupHold
 	#define DelaySetupHold()	do{Nop();Nop();Nop();}while(0)
 #endif
-#if (GetInstructionClock() > 48000000ul)
+#if (GetInstructionClock() > 32000000ul)
 	#undef DelaySetupHold
 	#define DelaySetupHold()	do{Nop();Nop();Nop();Nop();}while(0)
 #endif
-#if (GetInstructionClock() > 64000000ul)
+#if (GetInstructionClock() > 48000000ul)
 	#undef DelaySetupHold
 	#define DelaySetupHold()	do{Nop();Nop();Nop();Nop();Nop();}while(0)
+#endif
+#if (GetInstructionClock() > 64000000ul)
+	#undef DelaySetupHold
+	#define DelaySetupHold()	do{Nop();Nop();Nop();Nop();Nop();Nop();}while(0)
 #endif
 
 #if defined(__PIC32MX__)
@@ -174,6 +175,7 @@ static struct
 // Internal MAC level functions
 void ENC100DumpState(void);
 static void SendSystemReset(void);
+static void ToggleCRYPTEN(void);
 static WORD ReadReg(WORD wAddress);
 static void WriteReg(WORD wAddress, WORD wValue);
 static void BFSReg(WORD wAddress, WORD wBitMask);
@@ -192,6 +194,156 @@ static void WriteMemoryWindow(BYTE vWindow, BYTE *vData, WORD wLength);
 	static void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength);
 #endif
 
+
+
+// Compute some PMP register values
+#if   ENC100_INTERFACE_MODE == 1	// Parallel Mode 1: 8-bit demultiplexed (RD/WR)
+	#define PMP_ADRMUX		0x0			// Full demuxing of address and data
+	#define PMP_MODE16		0			// 8 bit
+	#define PMP_MODE		0x2			// Master mode 2: PMRD & PMWR, not PMRD/PMWR & PMENB
+	#define PMP_ADR_PINS	ENC100_TRANSLATE_TO_PIN_ADDR(0x7FFF)
+#elif ENC100_INTERFACE_MODE == 2	// Parallel Mode 2: 8-bit demultiplexed (RW/EN)
+	#define PMP_ADRMUX		0x0			// Full demuxing of address and data
+	#define PMP_MODE16		0			// 8 bit
+	#define PMP_MODE		0x3			// Master mode 1: PMRD/PMWR & PMENB, not PMRD & PMWR
+	#define PMP_ADR_PINS	ENC100_TRANSLATE_TO_PIN_ADDR(0x7FFF)
+#elif ENC100_INTERFACE_MODE == 3	// Parallel Mode 3: 16-bit demultiplexed (RD/WR)
+	#define PMP_ADRMUX		0x0			// Full demuxing of address and data
+	#define PMP_MODE16		1			// 16 bit
+	#define PMP_MODE		0x2			// Master mode 2: PMRD & PMWR, not PMRD/PMWR & PMENB
+	#define PMP_ADR_PINS	ENC100_TRANSLATE_TO_PIN_ADDR(0x3FFF)
+#elif ENC100_INTERFACE_MODE == 4	// Parallel Mode 4: 16-bit demultiplexed (RW/EN)
+	#define PMP_ADRMUX		0x0			// Full demuxing of address and data
+	#define PMP_MODE16		1			// 16 bit
+	#define PMP_MODE		0x3			// Master mode 1: PMRD/PMWR & PMENB, not PMRD & PMWR
+	#define PMP_ADR_PINS	ENC100_TRANSLATE_TO_PIN_ADDR(0x3FFF)
+#elif ENC100_INTERFACE_MODE == 5	// Parallel Mode 5: 8-bit multiplexed (RD/WR)
+	#define PMP_ADRMUX		0x1			// Partially multiplexed address and data
+	#define PMP_MODE16		0			// 8 bit
+	#define PMP_MODE		0x2			// Master mode 2: PMRD & PMWR, not PMRD/PMWR & PMENB
+	#define PMP_ADR_PINS	(ENC100_TRANSLATE_TO_PIN_ADDR(0x7F00) | 0x0001)
+#elif ENC100_INTERFACE_MODE == 6	// Parallel Mode 6: 8-bit multiplexed (RW/EN)
+	#define PMP_ADRMUX		0x1			// Partially multiplexed address and data
+	#define PMP_MODE16		0			// 8 bit
+	#define PMP_MODE		0x3			// Master mode 1: PMRD/PMWR & PMENB, not PMRD & PMWR
+	#define PMP_ADR_PINS	(ENC100_TRANSLATE_TO_PIN_ADDR(0x7F00) | 0x0001)
+#elif ENC100_INTERFACE_MODE == 9	// Parallel Mode 9: 16-bit multiplexed (RD/WR)
+	#define PMP_ADRMUX		0x3			// Fully multiplexed address and data
+	#define PMP_MODE16		1			// 16 bit
+	#define PMP_MODE		0x2			// Master mode 2: PMRD & PMWR, not PMRD/PMWR & PMENB
+	#define PMP_ADR_PINS	0x0001
+#elif ENC100_INTERFACE_MODE == 10	// Parallel Mode 10: 16-bit multiplexed (RW/EN)
+	#define PMP_ADRMUX		0x3			// Fully multiplexed address and data
+	#define PMP_MODE16		1			// 16 bit
+	#define PMP_MODE		0x3			// Master mode 1: PMRD/PMWR & PMENB, not PMRD & PMWR
+	#define PMP_ADR_PINS	0x0001
+#endif
+
+// Calculate the minimum number of wait states to ensure a 75ns or longer pulse width for READ and WRITE strobes
+#if defined(__PIC32MX__)	// PIC32 is offset by one (i.e. 0 = one wait state)
+	#define OPTIMAL_PMP_WAIT_STATES ((BYTE)((double)GetPeripheralClock()*0.000000075))
+#else
+	#define OPTIMAL_PMP_WAIT_STATES ((BYTE)((double)GetPeripheralClock()*0.000000075 + 0.9999))
+#endif
+
+#if ((ENC100_INTERFACE_MODE == 3) || (ENC100_INTERFACE_MODE == 4) || (ENC100_INTERFACE_MODE == 9) || (ENC100_INTERFACE_MODE == 10)) && !defined(ENC100_BIT_BANG_PMP)
+	#if !defined(__PIC32MX__)
+		#error "16-bit PMP mode is only available on PIC32.  Use big bang mode or ENC100_INTERFACE_MODE of 1, 2, 5, or 6 (8-bit) instead."
+	#endif
+#endif
+
+	
+
+// Compute optimal SPI speed and define the ConfigureSPIModule() macro function 
+// to load it up quickly whenever we want to use the SPI
+#if defined(__18CXX)
+	#define OPTIMAL_PRESCALE	0x00	// Default to divide by 4 setting
+	#if GetPeripheralClock() > ENC100_MAX_SPI_FREQ
+		#undef OPTIMAL_PRESCALE
+		#define OPTIMAL_PRESCALE 0x01	// Use divide by 16 setting
+	#endif	
+	#if GetPeripheralClock()/16 > ENC100_MAX_SPI_FREQ
+		#undef OPTIMAL_PRESCALE
+		#define OPTIMAL_PRESCALE 0x02	// Use divide by 64 setting
+	#endif
+	#define ConfigureSPIModule()	do{																				\
+										ENC100_SPICON1 = 0;							/* SSPEN = 0 */					\
+										ENC100_SPISTAT = 0x40;						/* CKE = 1 (transmit data on rising edge), SMP = 0 (sample at middle of output time) */ \
+										ENC100_SPICON1 = OPTIMAL_PRESCALE | 0x20;	/* SSPEN = 1, set clock speed */\
+									}while(0)
+	#define PMCONbits	PMCONHbits	// Remap for PMPEN bit accessed inline
+	#define ConfigurePMPModule()	do{																				\
+										PMCONHbits.PMPEN = 0;														\
+										PMCONH = (PMP_ADRMUX<<3) | 0x03;	/* PTWREN = 1, PTRDEN = 1 */			\
+										PMCONL = 0x23;						/* ALP = 1, WRSP = 1, RDSP = 1 */		\
+										PMMODEH = (PMP_MODE16<<2) | (PMP_MODE);										\
+										PMMODEL = (OPTIMAL_PMP_WAIT_STATES<<2);										\
+										PMAENH = ((BYTE)(PMP_ADR_PINS>>8));											\
+										PMAENL = ((BYTE)PMP_ADR_PINS);												\
+										PMCONHbits.PMPEN = 1;														\
+									}while(0)
+#elif defined(__C30__)
+	// Ensure SPI doesn't exceed processor limit
+	#if (defined(__PIC24F__) || defined(__PIC24FK__) || defined(__PIC24H__) || defined(__dsPIC33F__)) && ENC100_MAX_SPI_FREQ > 8000000
+		#undef ENC100_MAX_SPI_FREQ
+		#define ENC100_MAX_SPI_FREQ	8000000
+	#endif
+	#if defined(__dsPIC30F__) && ENC100_MAX_SPI_FREQ > 10000000
+		#undef ENC100_MAX_SPI_FREQ
+		#define ENC100_MAX_SPI_FREQ	10000000
+	#endif
+    
+    // Calculate optimal primary and secondary prescalers to make an SPI clock no faster than ENC100_MAX_SPI_FREQ
+   	#define OPTIMAL_PRESCALE		((((~((GetPeripheralClock()/64+ENC100_MAX_SPI_FREQ-1)/ENC100_MAX_SPI_FREQ - 1)) & 0x7)<<2) | 0x0)
+    #if GetPeripheralClock()/8/16 <= ENC100_MAX_SPI_FREQ
+    	#undef OPTIMAL_PRESCALE
+    	#define OPTIMAL_PRESCALE	((((~((GetPeripheralClock()/16+ENC100_MAX_SPI_FREQ-1)/ENC100_MAX_SPI_FREQ - 1)) & 0x7)<<2) | 0x1)
+    #endif
+    #if GetPeripheralClock()/8/4 <= ENC100_MAX_SPI_FREQ
+    	#undef OPTIMAL_PRESCALE
+   		#define OPTIMAL_PRESCALE	((((~((GetPeripheralClock()/4+ENC100_MAX_SPI_FREQ-1)/ENC100_MAX_SPI_FREQ - 1)) & 0x7)<<2) | 0x2)
+    #endif
+    #if GetPeripheralClock()/8/1 <= ENC100_MAX_SPI_FREQ
+    	#undef OPTIMAL_PRESCALE
+    	#define OPTIMAL_PRESCALE	((((~((GetPeripheralClock()/1+ENC100_MAX_SPI_FREQ-1)/ENC100_MAX_SPI_FREQ - 1)) & 0x7)<<2) | 0x3)
+    #endif
+
+	// Work around 1:1, 1:1 SPI errata on early PIC24FJ128GA010, PIC24HJ256GP610, dsPIC33FJ256GP710, etc. silicon where SCK stops running
+	#if (defined(__PIC24F__) || defined(__PIC24H__) || defined(__dsPIC33F__)) && (OPTIMAL_PRESCALE == 0x1F)
+		#undef OPTIMAL_PRESCALE
+		#define OPTIMAL_PRESCALE	0x1B
+	#endif
+
+
+	#define ConfigureSPIModule()	do{																									\
+										ENC100_SPISTAT = 0;										/* Turn off SPI */						\
+										ENC100_SPICON1 = OPTIMAL_PRESCALE | 0x0100 | 0x0020;	/* CKE = 1, MSTEN = 1 */				\
+									    ENC100_SPICON2 = 0;										/* Legacy non enhanced buffering */		\
+									    ENC100_SPISTAT = 0x8000;								/* Turn on SPI */						\
+									}while(0)
+
+	#define ConfigurePMPModule()	do{																									\
+										PMCONbits.PMPEN = 0;																			\
+										PMCON = (PMP_ADRMUX<<11) | 0x0323;	/* PTWREN = 1, PTRDEN = 1, ALP = 1, WRSP = 1, RDSP = 1 */	\
+										PMMODE = (PMP_MODE16<<10) | (PMP_MODE<<8) | (OPTIMAL_PMP_WAIT_STATES<<2);						\
+										PMAEN = PMP_ADR_PINS;																			\
+										PADCFG1bits.PMPTTL = 0;				/* Use schmitt trigger input buffers */						\
+										PMCONbits.PMPEN = 1;																			\
+									}while(0)
+#elif defined(__C32__)
+	#define ConfigureSPIModule()	do{																									\
+										ENC100_SPICON1 = 0;					/* Turn off SPI */											\
+										ENC100_SPIBRG = (GetPeripheralClock()-1ul)/2ul/ENC100_MAX_SPI_FREQ;								\
+										ENC100_SPICON1 = 0x00008320;		/* ON = 1, SMP = 1, CKE = 1, MSTEN = 1 */					\
+									}while(0)
+	#define ConfigurePMPModule()	do{																									\
+										PMCONbits.PMPEN = 0;																			\
+										PMCON = (PMP_ADRMUX<<11) | 0x0323;	/* PMPTTL = 0, PTWREN = 1, PTRDEN = 1, ALP = 1, WRSP = 1, RDSP = 1 */	\
+										PMMODE = (PMP_MODE16<<10) | (PMP_MODE<<8) | (OPTIMAL_PMP_WAIT_STATES<<2);						\
+										PMAEN = PMP_ADR_PINS;																			\
+										PMCONbits.PMPEN = 1;																			\
+									}while(0)
+#endif
 
 /******************************************************************************
  * Function:        void ENC100Init(void)
@@ -222,11 +374,12 @@ void MACInit(void)
 		ENC100_MDIX_IO = 0;
 	#endif
 
-	#if (ENC100_INTERFACE_MODE >= 1)	// Parallel mode
-		#if defined(ENC100_CS_TRIS)
-			DeassertChipSelect();
-			ENC100_CS_TRIS = 0;
-		#endif
+	#if defined(ENC100_CS_TRIS)		// Chip Select line from PIC
+		DeassertChipSelect();
+		ENC100_CS_TRIS = 0;
+	#endif
+
+	#if (ENC100_INTERFACE_MODE >= 1) && defined(ENC100_BIT_BANG_PMP)	// Parallel bit-bang mode needs I/O pins to be configured.  PMP will control pins automatically.
 		ENC100_SO_WR_B0SEL_EN_IO = 0;
 		ENC100_SO_WR_B0SEL_EN_TRIS = 0;
 		ENC100_SI_RD_RW_IO = 0;
@@ -235,142 +388,25 @@ void MACInit(void)
 			ENC100_SCK_AL_IO = 0;
 			ENC100_SCK_AL_TRIS = 0;
 		#endif
-
-		#if !defined(ENC100_BIT_BANG_PMP)
-			// PMCON register
-			PMCONbits.PMPEN = 1;
-			#if ENC100_INTERFACE_MODE >= 5	// Multiplexed mode
-				#if defined(__PIC32MX__) && ((ENC100_INTERFACE_MODE == 9) || (ENC100_INTERFACE_MODE == 10))
-					// PIC32s can use 16-bit data bus with address multiplexing that doesn't clobber Explorer 16 UART2 or other functions
-					PMCONbits.ADRMUX = 0x3;	// 16-bit data + full address muxing
-				#else
-					PMCONbits.ADRMUX = 0x1;	// 8-bit data + partial address muxing
-				#endif
-			#else
-				PMCONbits.ADRMUX = 0x0;	// Fully demultiplexed address
-			#endif
-			PMCONbits.PTWREN = 1;	// Enable PMWR strobe
-			PMCONbits.PTRDEN = 1;	// Enable PMRD strobe
-			PMCONbits.ALP = 1;		// AL strobe is active high polarity
-			PMCONbits.WRSP = 1;		// PMWR strobe is active high polarity
-			PMCONbits.RDSP = 1;		// PMRD strobe is active high polarity
-
-			// PMMODE register
-			PMMODEbits.INCM = 0x0;	// No address increment
-			#if defined(__PIC32MX__) && ((ENC100_INTERFACE_MODE == 3) || (ENC100_INTERFACE_MODE == 4) || (ENC100_INTERFACE_MODE == 9) || (ENC100_INTERFACE_MODE == 10))
-				PMMODEbits.MODE16 = 1;	// 16-bit mode
-			#else
-				PMMODEbits.MODE16 = 0;	// 8-bit mode
-			#endif
-			#if (ENC100_INTERFACE_MODE == 1) || (ENC100_INTERFACE_MODE == 3) || (ENC100_INTERFACE_MODE == 5) || (ENC100_INTERFACE_MODE == 9)	// READ, WRITE strobes
-				PMMODEbits.MODE = 0x2;	// Master mode 2: PMRD & PMWR, not PMRD/PMWR & PMENB
-			#else	// READ/WRITE, ENABLE strobes
-				PMMODEbits.MODE = 0x1;
-			#endif
-			PMMODEbits.WAITB = 0x0;	// 1Tcy wait for set up time and address latch time
-			// Calculate the minimum number of wait states to ensure a 75ns or longer pulse width for READ and WRITE strobes
-			#if defined(__PIC32MX__)	// PIC32 is offset by one (i.e. 0 = one wait state)
-				#define OPTIMAL_PMP_WAIT_STATES ((BYTE)((double)GetPeripheralClock()*0.000000075))
-			#else
-				#define OPTIMAL_PMP_WAIT_STATES ((BYTE)((double)GetPeripheralClock()*0.000000075 + 0.9999))
-			#endif
-			PMMODEbits.WAITM = OPTIMAL_PMP_WAIT_STATES;
-			PMMODEbits.WAITE = 0x0;	// 1Tcy wait for hold time
-
-			// PMAEN address enables register			
-			#if (ENC100_INTERFACE_MODE == 1) || (ENC100_INTERFACE_MODE == 2) // 8-bit demux
-				PMAEN = ENC100_TRANSLATE_TO_PIN_ADDR(0x7FFF);
-			#elif (ENC100_INTERFACE_MODE == 3) || (ENC100_INTERFACE_MODE == 4)	// 16-bit demux
-				PMAEN = ENC100_TRANSLATE_TO_PIN_ADDR(0x3FFF);
-				#if !defined(__PIC32MX__)
-					#error 16-bit PMP mode is only available on PIC32.  Use ENC100_INTERFACE_MODE of 1, 2, 5, or 6 (8-bit) instead.
-				#endif
-			#elif (ENC100_INTERFACE_MODE == 5) || (ENC100_INTERFACE_MODE == 6)	// 8-bit mux
-				PMAEN = ENC100_TRANSLATE_TO_PIN_ADDR(0x7F00) | 0x0001;
-			#elif (ENC100_INTERFACE_MODE == 9) || (ENC100_INTERFACE_MODE == 10)	// 16-bit mux
-				PMAEN = 0x0001; // Connect PMA<0> to AL
-				#if !defined(__PIC32MX__)
-					#error 16-bit PMP mode is only available on PIC32.  Use ENC100_INTERFACE_MODE of 1, 2, 5, or 6 (8-bit) instead.
-				#endif
-			#endif
-
-			// Use CMOS schmitt trigger input buffers
-			#if defined(__PIC32MX__)
-				PMCONbits.PMPTTL = 0;	
-			#else
-				PADCFG1bits.PMPTTL = 0;
-			#endif
-		#else
-			ENC100_INIT_PSP_BIT_BANG();
+		#if (ENC100_INTERFACE_MODE == 3) || (ENC100_INTERFACE_MODE == 4) || (ENC100_INTERFACE_MODE == 9) || (ENC100_INTERFACE_MODE == 10)	// If PSP data width is 16-bits, set Write High/Byte 1 select as output
+			ENC100_WRH_B1SEL_IO = 0;
+			ENC100_WRH_B1SEL_TRIS = 0;
 		#endif
-	#else	// Use SPI interface
-		vCurrentBank = 0;			// Needed for SPI only
 
-		// Set up the SPI module on the PIC for communications with the ENCX24J600
-		DeassertChipSelect();
-		ENC100_CS_TRIS = 0;
+		ENC100_INIT_PSP_BIT_BANG();
+	#elif (ENC100_INTERFACE_MODE == 0)	// Use SPI interface
+		vCurrentBank = 0;			// Needed for SPI only
 
 	    // Set up SPI pins on PIC18s
 		#if defined(__18CXX)
 			ENC100_SCK_AL_TRIS = 0;
 			ENC100_SI_RD_RW_TRIS = 0;
 			ENC100_SO_WR_B0SEL_EN_TRIS = 1;
-
-			ENC100_SPICON1 = 0x20;		// SSPEN bit is set, SPI in master mode, FOSC/4, 
-										//   IDLE state is low level
 			ENC100_SPI_IF = 0;
-			ENC100_SPISTATbits.CKE = 1;	// Transmit data on rising edge of clock
-			ENC100_SPISTATbits.SMP = 0;	// Input sampled at middle of data output time
-		#elif defined(__C30__)
-		    ENC100_SPISTAT = 0;    		// clear SPI
-
-			// Ensure SPI doesn't exceed processor limit
-			#if (defined(__PIC24F__) || defined(__PIC24H__) || defined(__dsPIC33F__)) && ENC100_MAX_SPI_FREQ > 8000000
-				#undef ENC100_MAX_SPI_FREQ
-				#define ENC100_MAX_SPI_FREQ	8000000
-			#endif
-			#if defined(__dsPIC30F__) && ENC100_MAX_SPI_FREQ > 10000000
-				#undef ENC100_MAX_SPI_FREQ
-				#define ENC100_MAX_SPI_FREQ	10000000
-			#endif
-		    
-		    // Calculate optimal primary and secondary prescalers to make an SPI clock no faster than ENC100_MAX_SPI_FREQ
-		    #if GetPeripheralClock()/8/64 > ENC100_MAX_SPI_FREQ
-		    	#warning Minimum possible SPI frequency is faster than ENC100_MAX_SPI_FREQ
-		    #endif
-	    	#define OPTIMAL_PRESCALE		((((~((GetPeripheralClock()/64+ENC100_MAX_SPI_FREQ-1)/ENC100_MAX_SPI_FREQ - 1)) & 0x7)<<2) | 0x0)
-		    #if GetPeripheralClock()/8/16 <= ENC100_MAX_SPI_FREQ
-		    	#undef OPTIMAL_PRESCALE
-		    	#define OPTIMAL_PRESCALE	((((~((GetPeripheralClock()/16+ENC100_MAX_SPI_FREQ-1)/ENC100_MAX_SPI_FREQ - 1)) & 0x7)<<2) | 0x1)
-		    #endif
-		    #if GetPeripheralClock()/8/4 <= ENC100_MAX_SPI_FREQ
-		    	#undef OPTIMAL_PRESCALE
-	    		#define OPTIMAL_PRESCALE	((((~((GetPeripheralClock()/4+ENC100_MAX_SPI_FREQ-1)/ENC100_MAX_SPI_FREQ - 1)) & 0x7)<<2) | 0x2)
-		    #endif
-		    #if GetPeripheralClock()/8/1 <= ENC100_MAX_SPI_FREQ
-		    	#undef OPTIMAL_PRESCALE
-		    	#define OPTIMAL_PRESCALE	((((~((GetPeripheralClock()/1+ENC100_MAX_SPI_FREQ-1)/ENC100_MAX_SPI_FREQ - 1)) & 0x7)<<2) | 0x3)
-		    #endif
-
-			// Work around 1:1, 1:1 SPI errata on early PIC24FJ128GA010, PIC24HJ256GP610, dsPIC33FJ256GP710, etc. silicon where SCK stops running
-			#if (defined(__PIC24F__) || defined(__PIC24H__) || defined(__dsPIC33F__)) && (OPTIMAL_PRESCALE == 0x1F)
-				#undef OPTIMAL_PRESCALE
-				#define OPTIMAL_PRESCALE	0x1B
-			#endif
-
-			ENC100_SPICON1 = OPTIMAL_PRESCALE;
-		    ENC100_SPICON2 = 0;
-		    ENC100_SPICON1bits.CKE = 1;
-		    ENC100_SPICON1bits.MSTEN = 1;
-		    ENC100_SPISTATbits.SPIEN = 1;
-		#elif defined(__C32__)
-			ENC100_SPIBRG = (GetPeripheralClock()-1ul)/2ul/ENC100_MAX_SPI_FREQ;
-		    ENC100_SPICON1bits.CKE = 1;
-		    ENC100_SPICON1bits.MSTEN = 1;
-			ENC100_SPICON1bits.ON = 1;
 		#endif
-	#endif
 
+		ConfigureSPIModule();
+	#endif
 
 	// Perform a reliable reset
 	SendSystemReset();
@@ -617,7 +653,7 @@ BOOL MACGetHeader(MAC_ADDR *remote, BYTE* type)
 					// into each other, you don't have a lock-step switching 
 					// problem in which both devices swap MDI mode 
 					// simultaneously and never link up.
-					wMDIXTimer = (WORD)TickGetDiv256() + (WORD)(TICK_SECOND/256u) + (WORD)(55ul*TICK_SECOND/256ul/100ul*(DWORD)rand()/(DWORD)RAND_MAX);
+					wMDIXTimer = (WORD)TickGetDiv256() + (WORD)(TICK_SECOND/256u) + (WORD)(55ul*TICK_SECOND/256ul/100ul*(DWORD)LFSRRand()/65535ul);
 
 					//// Restart auto-negotiation
 					//WritePHYReg(PHCON1, PHCON1_ANEN | PHCON1_RENEG);
@@ -666,8 +702,7 @@ BOOL MACGetHeader(MAC_ADDR *remote, BYTE* type)
 	if(header.NextPacketPointer > RXSTOP || ((BYTE_VAL*)(&header.NextPacketPointer))->bits.b0 ||
 	   header.StatusVector.bits.Zero || header.StatusVector.bits.ZeroH || 
 	   header.StatusVector.bits.CRCError ||
-	   header.StatusVector.bits.ByteCount > 1522u ||
-	   !header.StatusVector.bits.ReceiveOk)
+	   header.StatusVector.bits.ByteCount > 1522u)
 	{
 		//ENC100DumpState();
 		Nop();
@@ -847,7 +882,7 @@ void MACSetReadPtrInRx(WORD offset)
 
 
 /******************************************************************************
- * Function:        WORD MACSetWritePtr(WORD address)
+ * Function:        PTR_BASE MACSetWritePtr(PTR_BASE address)
  *
  * PreCondition:    None
  *
@@ -862,7 +897,7 @@ void MACSetReadPtrInRx(WORD offset)
  *
  * Note:			None
  *****************************************************************************/
-WORD MACSetWritePtr(WORD address)
+PTR_BASE MACSetWritePtr(PTR_BASE address)
 {
 	WORD wOldWritePtr;
 
@@ -876,7 +911,7 @@ WORD MACSetWritePtr(WORD address)
 
 
 /******************************************************************************
- * Function:        WORD MACSetReadPtr(WORD Address)
+ * Function:        PTR_BASE MACSetReadPtr(PTR_BASE Address)
  *
  * PreCondition:    None
  *
@@ -891,7 +926,7 @@ WORD MACSetWritePtr(WORD address)
  *
  * Note:			None
  *****************************************************************************/
-WORD MACSetReadPtr(WORD address)
+PTR_BASE MACSetReadPtr(PTR_BASE address)
 {
 	WORD wOldReadPtr;
 
@@ -1000,7 +1035,7 @@ WORD CalcIPBufferChecksum(WORD len)
 
 /*****************************************************************************
   Function:
-	void MACMemCopyAsync(WORD destAddr, WORD sourceAddr, WORD len)
+	void MACMemCopyAsync(PTR_BASE destAddr, PTR_BASE sourceAddr, WORD len)
 
   Summary:
 	Asynchronously copies data from one address to another within the 24KB 
@@ -1016,10 +1051,11 @@ WORD CalcIPBufferChecksum(WORD len)
 	SPI bus must be initialized (done in MACInit()).
 
   Parameters:
-	destAddr - Destination address in the Ethernet memory to copy to.  If the 
-		MSb is set, the current EGPWRPT value will be used instead.
-	sourceAddr - Source address to read from.  If the MSb is set, the current 
-		EGPRDPT value will be used instead.
+	destAddr - Destination address in the Ethernet memory to copy to.  If 
+		(PTR_BASE)-1 is specified, the current EGPWRPT value will be used 
+		instead.
+	sourceAddr - Source address to read from.  If (PTR_BASE)-1 is specified, 
+		the current EGPRDPT value will be used instead.
 	len - Number of bytes to copy
 
   Returns:
@@ -1038,21 +1074,21 @@ WORD CalcIPBufferChecksum(WORD len)
  	If a prior transfer is already in progress prior to calling this function, 
  	this function will block until it can start this transfer.
 
- 	If a negative value is used for the sourceAddr or destAddr parameters, 
+ 	If (PTR_BASE)-1 is used for the sourceAddr or destAddr parameters, 
  	then that pointer will get updated with the next address after the read or 
  	write.
  *****************************************************************************/
-void MACMemCopyAsync(WORD destAddr, WORD sourceAddr, WORD len)
+void MACMemCopyAsync(PTR_BASE destAddr, PTR_BASE sourceAddr, WORD len)
 {
 	WORD wNewReadPtr;
 
 	// Decode destination and source addresses
-	if(((WORD_VAL*)&destAddr)->bits.b15)
+	if(destAddr == (PTR_BASE)-1)
 	{
 		destAddr = ReadReg(EGPWRPT);
 		WriteReg(EGPWRPT, destAddr + len);
 	}
-	if(((WORD_VAL*)&sourceAddr)->bits.b15)
+	if(sourceAddr == (PTR_BASE)-1)
 	{
 		sourceAddr = ReadReg(ERXRDPT);
 		wNewReadPtr = sourceAddr + len;
@@ -1282,7 +1318,8 @@ void MACPowerDown(void)
 	// Enter sleep mode
 	ENC100Flags.PoweredDown = 1;
 	ENC100Flags.CryptoEnabled = 0;
-	BFCReg(EIR, EIR_CRYPTEN);					// Turn off ModdEx/AES clock
+	if(ReadReg(EIR) & EIR_CRYPTEN)				// Turn off ModdEx/AES clock
+		ToggleCRYPTEN();
 	WritePHYReg(PHCON1, PHCON1_PSLEEP);			// Turn off the PHY
 	BFCReg(ECON2, ECON2_ETHEN | ECON2_STRCH);	// Turn off general internal clocks and LED stretching so they immediately turn off and don't get stuck on
 }//end MACPowerDown
@@ -1291,7 +1328,7 @@ void MACPowerDown(void)
 /******************************************************************************
  * Function:        void MACEDPowerDown(void)
  *
- * PreCondition:    SPI bus must be initialized (done in MACInit()).
+ * PreCondition:    SPI/PSP bus must be initialized (done in MACInit()).
  *
  * Input:           None
  *
@@ -1302,7 +1339,7 @@ void MACPowerDown(void)
  * Overview:        MACEDPowerDown puts the ENCx24J600 PHY in Energy Detect 
  *					mode. In this mode, the PHY will passively listen for link 
  *					pulses and automatically link up, if detected. This can be 
- *					detected via the MACIsLinkned() function.  This power state 
+ *					detected via the MACIsLinked() function.  This power state 
  *					will save power only when an Ethernet cable is unattached.
  *
  *					To exit energy detect power down, call MACPowerUp().
@@ -1316,13 +1353,8 @@ void MACEDPowerDown(void)
 {
 	// Put the PHY into energy detect mode
 	WritePHYReg(PHCON2, PHCON2_EDPWRDN);		
-
-	// Go into general power down
-	ENC100Flags.CryptoEnabled = 0;
-	BFCReg(EIR, EIR_CRYPTEN);
-	ENC100Flags.PoweredDown = 1;
-	BFCReg(ECON2, ECON2_ETHEN | ECON2_STRCH);	
 }//end MACEDPowerDown
+
 
 /******************************************************************************
  * Function:        void MACPowerUp(void)
@@ -1369,22 +1401,32 @@ void MACPowerUp(void)
 /******************************************************************************
  * Function:        void SetCLKOUT(BYTE NewConfig)
  *
- * PreCondition:    SPI bus must be initialized (done in MACInit()).
+ * PreCondition:    SPI or Parallel bus must be initialized (done in MACInit()).
  *
  * Input:           NewConfig - 0x00: CLKOUT disabled (pin driven low)
- *								0x01: Divide by 1 (25 MHz)
- *								0x02: Divide by 2 (12.5 MHz)
- *								0x03: Divide by 3 (8.333333 MHz)
- *								0x04: Divide by 4 (6.25 MHz, POR default)
- *								0x05: Divide by 8 (3.125 MHz)
+ *								0x01: 33.333 MHz
+ *								0x02: 25.000 MHz
+ *								0x03: 20.000 MHz
+ *								0x04: 16.667 MHz
+ *								0x05: 12.500 MHz
+ *								0x06: 10.000 MHz
+ *								0x07:  8.333 MHz
+ *								0x08:  8.000 MHz (47.5% duty cycle)
+ *								0x09:  6.250 MHz
+ *								0x0A:  5.000 MHz
+ *								0x0B:  4.000 MHz
+ *								0x0C:  3.125 MHz
+ *								0x0D: CLKOUT disabled (pin driven low)
+ *								0x0E: 100.00 kHz
+ *								0x0F:  50.00 kHz
  *
  * Output:          None
  *
  * Side Effects:    None
  *
- * Overview:        Writes the value of NewConfig into the ECOCON register.  
- *					The CLKOUT pin will beginning outputting the new frequency
- *					immediately.
+ * Overview:        Writes the value of NewConfig into the COCON bits of ECON2
+ *					register.  The CLKOUT pin will beginning outputting the 
+ *					new frequency immediately.
  *
  * Note:            
  *****************************************************************************/
@@ -1401,22 +1443,31 @@ void SetCLKOUT(BYTE NewConfig)
 /******************************************************************************
  * Function:        BYTE GetCLKOUT(void)
  *
- * PreCondition:    SPI bus must be initialized (done in MACInit()).
+ * PreCondition:    SPI or Parallel bus must be initialized (done in MACInit()).
  *
  * Input:           None
  *
- * Output:          BYTE - 0x00: CLKOUT disabled (pin driven low)
- *						   0x01: Divide by 1 (25 MHz)
- *						   0x02: Divide by 2 (12.5 MHz)
- *						   0x03: Divide by 3 (8.333333 MHz)
- *						   0x04: Divide by 4 (6.25 MHz, POR default)
- *						   0x05: Divide by 8 (3.125 MHz)
- *						   0x06: Reserved
- *						   0x07: Reserved
+ * Output:          BYTE -	0x00: CLKOUT disabled (pin driven low)
+ *							0x01: 33.333 MHz
+ *							0x02: 25.000 MHz
+ *							0x03: 20.000 MHz
+ *							0x04: 16.667 MHz
+ *							0x05: 12.500 MHz
+ *							0x06: 10.000 MHz
+ *							0x07:  8.333 MHz
+ *							0x08:  8.000 MHz (47.5% duty cycle)
+ *							0x09:  6.250 MHz
+ *							0x0A:  5.000 MHz
+ *							0x0B:  4.000 MHz
+ *							0x0C:  3.125 MHz
+ *							0x0D: CLKOUT disabled (pin driven low)
+ *							0x0E: 100.00 kHz
+ *							0x0F:  50.00 kHz
  *
  * Side Effects:    None
  *
- * Overview:        Returns the current value of the ECOCON register.
+ * Overview:        Returns the current value of the COCON bits of ECON2 
+ *					register.
  *
  * Note:            None
  *****************************************************************************/
@@ -1424,7 +1475,7 @@ BYTE GetCLKOUT(void)
 {	
 	WORD w;
 
-	w = ReadReg(ECON2) & 0xF0FF;	
+	w = ReadReg(ECON2);	
 
 	return ((BYTE*)&w)[1] & 0x0F;
 }//end GetCLKOUT
@@ -1433,31 +1484,65 @@ BYTE GetCLKOUT(void)
 /******************************************************************************
  * Function:        void SetRXHashTableEntry(MAC_ADDR DestMACAddr)
  *
- * PreCondition:    SPI bus must be initialized (done in MACInit()).
+ * PreCondition:    SPI/PSP interface must be initialized (done in MACInit()).
  *
  * Input:           DestMACAddr: 6 byte group destination MAC address to allow 
- *								 through the Hash Table Filter
+ *								 through the Hash Table Filter.  If DestMACAddr 
+ *								 is set to 00-00-00-00-00-00, then the hash 
+ *								 table will be cleared of all entries and the 
+ *								 filter will be disabled.
  *
  * Output:          Sets the appropriate bit in the EHT* registers to allow 
- *					packets sent to DestMACAddr to be received if the Hash 
- *					Table receive filter is enabled
+ *					packets sent to DestMACAddr to be received and enables the 
+ *					Hash Table receive filter (if not already).
  *
  * Side Effects:    None
  *
  * Overview:        Calculates a CRC-32 using polynomial 0x4C11DB7 and then, 
  *					using bits 28:23 of the CRC, sets the appropriate bit in 
- *					the EHT* registers
+ *					the EHT1-EHT4 registers.
  *
  * Note:            This code is commented out to save code space on systems 
- *					that do not need this function.  Change the "#if 0" line 
- *					to "#if 1" to uncomment it.
+ *					that do not need this function.  Change the 
+ *					"#if STACK_USE_ZEROCONF_MDNS_SD" line to "#if 1" to 
+ *					uncomment it, assuming you aren't using the Zeroconf module, 
+ *					which requires mutlicast support and enables this function 
+ *					automatically.
+ *
+ *					There is no way to individually unset destination MAC 
+ *					addresses from the hash table since it is possible to have 
+ *					a hash collision and therefore multiple MAC addresses 
+ *					relying on the same hash table bit.  The stack would have 
+ *					to individually store each 6 byte MAC address to support 
+ *					this feature, which would waste a lot of RAM and be 
+ *					unnecessary in most applications.  As a simple compromise, 
+ *					you can call SetRXHashTableEntry() using a 
+ *					00-00-00-00-00-00 destination MAC address, which will clear 
+ *					the entire hash table and disable the hash table filter.  
+ *					This will allow you to then re-add the necessary 
+ *					destination address(es).
  *****************************************************************************/
-#if 0
+#if defined(STACK_USE_ZEROCONF_MDNS_SD)
 void SetRXHashTableEntry(MAC_ADDR DestMACAddr)
 {
 	DWORD_VAL CRC = {0xFFFFFFFF};
 	WORD HTRegister;
 	BYTE i, j;
+
+	// Clear the Hash Table bits and disable the Hash Table Filter if a special 
+	// 00-00-00-00-00-00 destination MAC address is provided.
+	if((DestMACAddr.v[0] | DestMACAddr.v[1] | DestMACAddr.v[2] | DestMACAddr.v[3] | DestMACAddr.v[4] | DestMACAddr.v[5]) == 0x00u)
+	{
+		// Disable the Hash Table receive filter and clear the hash table
+		BFCReg(ERXFCON, ERXFCON_HTEN);
+		WriteReg(EHT1, 0x0000);
+		WriteReg(EHT2, 0x0000);
+		WriteReg(EHT3, 0x0000);
+		WriteReg(EHT4, 0x0000);
+
+		return;
+	}
+
 
 	// Calculate a CRC-32 over the 6 byte MAC address 
 	// using polynomial 0x4C11DB7
@@ -1491,6 +1576,9 @@ void SetRXHashTableEntry(MAC_ADDR DestMACAddr)
 	
 	// Set the proper bit in the Hash Table
 	BFSReg(HTRegister, 1<<i);
+	
+	// Ensure that the Hash Table receive filter is enabled
+	BFSReg(ERXFCON, ERXFCON_HTEN);
 }
 #endif
 
@@ -1535,9 +1623,27 @@ static void SendSystemReset(void)
 		ENC100_POR_IO = 0;
 		ENC100_POR_TRIS = 0;
 		DelayMs(2);
+
+		// If the INT/SPISEL signal is connected, force it to the correct state 
+		// for latching SPI or PSP mode.
+		#if defined(ENC100_INT_TRIS)	
+			#if ENC100_INTERFACE_MODE == 0	// SPI
+				ENC100_INT_IO = 1;
+			#else	// PSP
+				ENC100_INT_IO = 0;
+			#endif
+			ENC100_INT_TRIS = 0;
+		#endif
+
+		// Turn on power and wait for interface latching to occur
 		ENC100_POR_IO = 1;
 		vCurrentBank = 0;
 		Delay10us(40);
+		
+		// Tri-state interrupt GPIO so that we don't cause bus contention.
+		#if defined(ENC100_INT_TRIS)
+			ENC100_INT_TRIS = 1;
+		#endif
 	#endif
 	
 	// Perform a reset via the SPI/PSP interface
@@ -1571,7 +1677,7 @@ static void SendSystemReset(void)
 
 
 	// If using PSP, verify all address and data lines are working
-	#if (ENC100_INTERFACE_MODE >= 1) && defined(ENC100_PSP_USE_INDIRECT_RAM_ADDRESSING)
+	#if (ENC100_INTERFACE_MODE >= 1) && (ENC100_INTERFACE_MODE < 9) && defined(ENC100_PSP_USE_INDIRECT_RAM_ADDRESSING)
 	{
 		BYTE i;
 		WORD wTestWriteData, wTestReadData;
@@ -1612,18 +1718,25 @@ static void SendSystemReset(void)
 		// certain memory ranges to fail.
 
 		// Generate and write random pattern
-		srand(600);
+		LFSRSeedRand(600);
 		for(w = 0; w < ENC100_RAM_SIZE; w += sizeof(wTestWriteData))
 		{
-			wTestWriteData = rand() + rand();
+			wTestWriteData = LFSRRand();
 			WriteMemory(w, (BYTE*)&wTestWriteData, sizeof(wTestWriteData));
+			ReadMemory(w, (BYTE*)&wTestReadData, sizeof(wTestReadData));
+			
+			// See if the data matches.  If your application gets stuck here, 
+			// it means you have a hardware failure.  Check all of your PSP 
+			// address and data lines.
+			if(wTestWriteData != wTestReadData)
+				while(1);
 		}
 		
 		// Read back and verify random pattern
-		srand(600);
+		LFSRSeedRand(600);
 		for(w = 0; w < ENC100_RAM_SIZE; w += sizeof(wTestWriteData))
 		{
-			wTestWriteData = rand() + rand();
+			wTestWriteData = LFSRRand();
 			ReadMemory(w, (BYTE*)&wTestReadData, sizeof(wTestReadData));
 			
 			// See if the data matches.  If your application gets stuck here, 
@@ -1671,7 +1784,7 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 
 	#if !defined(ENC100_BIT_BANG_PMP) && ((ENC100_INTERFACE_MODE == 1) || (ENC100_INTERFACE_MODE == 2) || (ENC100_INTERFACE_MODE == 5) || (ENC100_INTERFACE_MODE == 6))
 	{
-		PMCONbits.PMPEN = 1;
+		ConfigurePMPModule();
 		AssertChipSelect();
 		while(wLength--)
 		{
@@ -1689,7 +1802,7 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		volatile WORD wDummy;
 		
 		wWORDAddress = wAddress>>1;
-		PMCONbits.PMPEN = 1;
+		ConfigurePMPModule();
 		AssertChipSelect();
 		if(wAddress & 0x1)		
 		{
@@ -1754,14 +1867,20 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	{
 		WORD wData;
 		
-		if(wLength == 0u)
-			return;
-		
+		ENC100_SET_ADDR_TRIS_OUT();
 		ENC100_SET_AD_TRIS_OUT();
 		AssertChipSelect();
 		if(wAddress & 0x1)		// Write high byte to odd address, if not WORD aligned
 		{
 			ENC100_SET_ADDR_IO(wAddress>>1);
+			#if 1 // ENC100_WRH_B1SEL_IO == ENC100_SO_WR_B0SEL_EN_IO	// Word writes only -- need to perform read-modify-write
+				ENC100_SET_AD_TRIS_IN();
+				ENC100_SI_RD_RW_IO = 1;
+				DelaySetupHold();
+				((BYTE*)&wData)[0] = ENC100_GET_AD_IOL();
+				ENC100_SI_RD_RW_IO = 0;
+				ENC100_SET_AD_TRIS_OUT();
+			#endif
 			((BYTE*)&wData)[1] = *vData++;
 			ENC100_SET_AD_IO(wData);
 			ENC100_WRH_B1SEL_IO = 1;
@@ -1785,6 +1904,14 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		if(wLength)				// Write final byte to low byte address, if needed
 		{
 			ENC100_SET_ADDR_IO(wAddress>>1);
+			#if 1 // ENC100_WRH_B1SEL_IO == ENC100_SO_WR_B0SEL_EN_IO	// Word writes only -- need to perform read-modify-write
+				ENC100_SET_AD_TRIS_IN();
+				ENC100_SI_RD_RW_IO = 1;
+				DelaySetupHold();
+				((BYTE*)&wData)[1] = ENC100_GET_AD_IOH();
+				ENC100_SI_RD_RW_IO = 0;
+				ENC100_SET_AD_TRIS_OUT();
+			#endif
 			((BYTE*)&wData)[0] = *vData++;
 			ENC100_SET_AD_IO(wData);
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
@@ -1796,15 +1923,23 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	{
 		WORD wData;
 		
-		if(wLength == 0u)
-			return;
-		
+		ENC100_SET_ADDR_TRIS_OUT();
 		ENC100_SET_AD_TRIS_OUT();
 		AssertChipSelect();
 		ENC100_SI_RD_RW_IO = 0;
 		if(wAddress & 0x1)		// Write high byte to odd address, if not WORD aligned
 		{
 			ENC100_SET_ADDR_IO(wAddress>>1);
+			#if 1 // ENC100_WRH_B1SEL_IO == ENC100_SO_WR_B0SEL_EN_IO	// Word writes only -- need to perform read-modify-write
+				ENC100_SET_AD_TRIS_IN();
+				ENC100_SI_RD_RW_IO = 1;
+				ENC100_SO_WR_B0SEL_EN_IO = 1;
+				DelaySetupHold();
+				((BYTE*)&wData)[0] = ENC100_GET_AD_IOL();
+				ENC100_SO_WR_B0SEL_EN_IO = 0;
+				ENC100_SI_RD_RW_IO = 0;
+				ENC100_SET_AD_TRIS_OUT();
+			#endif
 			((BYTE*)&wData)[1] = *vData++;
 			ENC100_SET_AD_IO(wData);
 			ENC100_WRH_B1SEL_IO = 1;
@@ -1828,6 +1963,16 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		if(wLength)				// Write final byte to low byte address, if needed
 		{
 			ENC100_SET_ADDR_IO(wAddress>>1);
+			#if 1 // ENC100_WRH_B1SEL_IO == ENC100_SO_WR_B0SEL_EN_IO	// Word writes only -- need to perform read-modify-write
+				ENC100_SET_AD_TRIS_IN();
+				ENC100_SI_RD_RW_IO = 1;
+				ENC100_SO_WR_B0SEL_EN_IO = 1;
+				DelaySetupHold();
+				((BYTE*)&wData)[1] = ENC100_GET_AD_IOH();
+				ENC100_SO_WR_B0SEL_EN_IO = 0;
+				ENC100_SI_RD_RW_IO = 0;
+				ENC100_SET_AD_TRIS_OUT();
+			#endif
 			((BYTE*)&wData)[0] = *vData++;
 			ENC100_SET_AD_IO(wData);
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
@@ -1837,14 +1982,14 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	}
 	#elif ENC100_INTERFACE_MODE == 5
 	{
-		ENC100_SET_AD_TRIS_OUT;
+		ENC100_SET_AD_TRIS_OUT();
 		AssertChipSelect();
 		while(wLength--)
 		{
 			ENC100_SET_AD_IO(wAddress);
 			ENC100_SCK_AL_IO = 1;
 			ENC100_SCK_AL_IO = 0;
-			ENC100_SET_AD_IO(*vData++);
+			ENC100_SET_AD_IOL(*vData++);
 			wAddress++;
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			ENC100_SO_WR_B0SEL_EN_IO = 0;
@@ -1853,7 +1998,7 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	}
 	#elif ENC100_INTERFACE_MODE == 6
 	{
-		ENC100_SET_AD_TRIS_OUT;
+		ENC100_SET_AD_TRIS_OUT();
 		AssertChipSelect();
 		ENC100_SI_RD_RW_IO = 0;
 		while(wLength--)
@@ -1861,7 +2006,7 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 			ENC100_SET_AD_IO(wAddress);
 			ENC100_SCK_AL_IO = 1;
 			ENC100_SCK_AL_IO = 0;
-			ENC100_SET_AD_IO(*vData++);
+			ENC100_SET_AD_IOL(*vData++);
 			wAddress++;
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			ENC100_SO_WR_B0SEL_EN_IO = 0;
@@ -1872,21 +2017,23 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	{
 		WORD wData;
 		
-		if(wLength == 0u)
-			return;
-		
-		ENC100_SET_AD_TRIS_OUT;
+		ENC100_SET_AD_TRIS_OUT();
 		AssertChipSelect();
 		if(wAddress & 0x1)		// Write high byte to odd address, if not WORD aligned
 		{
 			ENC100_SET_AD_IO(wAddress>>1);
 			ENC100_SCK_AL_IO = 1;
-			DelaySetupHold();
 			ENC100_SCK_AL_IO = 0;
-			DelaySetupHold();
+			#if 1 // ENC100_WRH_B1SEL_IO == ENC100_SO_WR_B0SEL_EN_IO	// Word writes only -- need to perform read-modify-write
+				ENC100_SET_AD_TRIS_IN();
+				ENC100_SI_RD_RW_IO = 1;
+				DelaySetupHold();
+				((BYTE*)&wData)[0] = ENC100_GET_AD_IOL();
+				ENC100_SI_RD_RW_IO = 0;
+				ENC100_SET_AD_TRIS_OUT();
+			#endif
 			((BYTE*)&wData)[1] = *vData++;
 			ENC100_SET_AD_IO(wData);
-			DelaySetupHold();
 			ENC100_WRH_B1SEL_IO = 1;
 			wAddress++;
 			wLength--;
@@ -1897,13 +2044,10 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		{
 			ENC100_SET_AD_IO(wAddress>>1);
 			ENC100_SCK_AL_IO = 1;
-			DelaySetupHold();
 			ENC100_SCK_AL_IO = 0;
-			DelaySetupHold();
 			((BYTE*)&wData)[0] = *vData++;
 			((BYTE*)&wData)[1] = *vData++;
 			ENC100_SET_AD_IO(wData);
-			DelaySetupHold();
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			ENC100_WRH_B1SEL_IO = 1;
 			wAddress += 2;
@@ -1916,12 +2060,17 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		{
 			ENC100_SET_AD_IO(wAddress>>1);
 			ENC100_SCK_AL_IO = 1;
-			DelaySetupHold();
 			ENC100_SCK_AL_IO = 0;
-			DelaySetupHold();
+			#if 1 // ENC100_WRH_B1SEL_IO == ENC100_SO_WR_B0SEL_EN_IO	// Word writes only -- need to perform read-modify-write
+				ENC100_SET_AD_TRIS_IN();
+				ENC100_SI_RD_RW_IO = 1;
+				DelaySetupHold();
+				((BYTE*)&wData)[1] = ENC100_GET_AD_IOH();
+				ENC100_SI_RD_RW_IO = 0;
+				ENC100_SET_AD_TRIS_OUT();
+			#endif
 			((BYTE*)&wData)[0] = *vData++;
 			ENC100_SET_AD_IO(wData);
-			DelaySetupHold();
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			DelaySetupHold();
 			ENC100_SO_WR_B0SEL_EN_IO = 0;
@@ -1932,39 +2081,40 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	{
 		WORD wData;
 		
-		if(wLength == 0u)
-			return;
-		
-		ENC100_SET_AD_TRIS_OUT;
+		ENC100_SET_AD_TRIS_OUT();
 		AssertChipSelect();
-		ENC100_SI_RD_RW_IO = 0;
 		if(wAddress & 0x1)		// Write high byte to odd address, if not WORD aligned
 		{
 			ENC100_SET_AD_IO(wAddress>>1);
 			ENC100_SCK_AL_IO = 1;
-			DelaySetupHold();
 			ENC100_SCK_AL_IO = 0;
-			DelaySetupHold();
+			#if 1 // ENC100_WRH_B1SEL_IO == ENC100_SO_WR_B0SEL_EN_IO	// Word writes only -- need to perform read-modify-write
+				ENC100_SET_AD_TRIS_IN();
+				ENC100_SI_RD_RW_IO = 1;
+				ENC100_SO_WR_B0SEL_EN_IO = 1;
+				DelaySetupHold();
+				((BYTE*)&wData)[0] = ENC100_GET_AD_IOL();
+				ENC100_SO_WR_B0SEL_EN_IO = 0;
+				ENC100_SET_AD_TRIS_OUT();
+			#endif
+			ENC100_SI_RD_RW_IO = 0;
 			((BYTE*)&wData)[1] = *vData++;
 			ENC100_SET_AD_IO(wData);
-			DelaySetupHold();
 			ENC100_WRH_B1SEL_IO = 1;
 			wAddress++;
 			wLength--;
 			DelaySetupHold();
 			ENC100_WRH_B1SEL_IO = 0;
 		}
+		ENC100_SI_RD_RW_IO = 0;
 		while(wLength >= 2u)		// Write all possible WORDs
 		{
 			ENC100_SET_AD_IO(wAddress>>1);
 			ENC100_SCK_AL_IO = 1;
-			DelaySetupHold();
 			ENC100_SCK_AL_IO = 0;
-			DelaySetupHold();
 			((BYTE*)&wData)[0] = *vData++;
 			((BYTE*)&wData)[1] = *vData++;
 			ENC100_SET_AD_IO(wData);
-			DelaySetupHold();
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			ENC100_WRH_B1SEL_IO = 1;
 			wAddress += 2;
@@ -1977,12 +2127,19 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		{
 			ENC100_SET_AD_IO(wAddress>>1);
 			ENC100_SCK_AL_IO = 1;
-			DelaySetupHold();
 			ENC100_SCK_AL_IO = 0;
-			DelaySetupHold();
+			#if 1 // ENC100_WRH_B1SEL_IO == ENC100_SO_WR_B0SEL_EN_IO	// Word writes only -- need to perform read-modify-write
+				ENC100_SET_AD_TRIS_IN();
+				ENC100_SI_RD_RW_IO = 1;
+				ENC100_SO_WR_B0SEL_EN_IO = 1;
+				DelaySetupHold();
+				((BYTE*)&wData)[1] = ENC100_GET_AD_IOH();
+				ENC100_SO_WR_B0SEL_EN_IO = 0;
+				ENC100_SET_AD_TRIS_OUT();
+			#endif
+			ENC100_SI_RD_RW_IO = 0;
 			((BYTE*)&wData)[0] = *vData++;
 			ENC100_SET_AD_IO(wData);
-			DelaySetupHold();
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			DelaySetupHold();
 			ENC100_SO_WR_B0SEL_EN_IO = 0;
@@ -2048,7 +2205,7 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	#endif
 
 	// Decode the vWindow handle to the litteral SFR address to read/write from/to
-	#if (ENC100_INTERFACE_MODE == 1) || (ENC100_INTERFACE_MODE == 2) || (ENC100_INTERFACE_MODE == 5) || (ENC100_INTERFACE_MODE == 6) || defined(ENC100_BIT_BANG_PMP)
+	#if (ENC100_INTERFACE_MODE == 1) || (ENC100_INTERFACE_MODE == 2) || (ENC100_INTERFACE_MODE == 5) || (ENC100_INTERFACE_MODE == 6)
 		wAddress = EUDADATA;
 		if(vWindow & GP_WINDOW)
 			wAddress = EGPDATA;
@@ -2063,7 +2220,8 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	#endif
 
 	#if (ENC100_INTERFACE_MODE >= 1) && !defined(ENC100_BIT_BANG_PMP)	// PMP under hardware control
-		PMCONbits.PMPEN = 1;
+	{	
+		ConfigurePMPModule();
 		AssertChipSelect();
 		PMADDR = wAddress;
 		while(wLength--)
@@ -2074,6 +2232,7 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		while(PMMODEbits.BUSY);
 		DeassertChipSelect();
 		PMCONbits.PMPEN = 0;
+	}
 	#elif ENC100_INTERFACE_MODE == 1	// Bit bang PMP
 		ENC100_SET_ADDR_TRIS_OUT();
 		ENC100_SET_AD_TRIS_OUT();
@@ -2101,12 +2260,13 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		DeassertChipSelect();
 	#elif ENC100_INTERFACE_MODE == 3		// Bit bang PMP
 	{
+		ENC100_SET_ADDR_TRIS_OUT();
 		ENC100_SET_AD_TRIS_OUT();
 		AssertChipSelect();
-		ENC100_SET_ADDR_IO(wAddress>>1);
+		ENC100_SET_ADDR_IO(wAddress);
 		while(wLength--)
 		{
-			ENC100_SET_AD_IO(*vData++);
+			ENC100_SET_AD_IOL(*vData++);
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			ENC100_SO_WR_B0SEL_EN_IO = 0;
 		}
@@ -2114,12 +2274,14 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	}
 	#elif ENC100_INTERFACE_MODE == 4		// Bit bang PMP
 	{
+		ENC100_SET_ADDR_TRIS_OUT();
 		ENC100_SET_AD_TRIS_OUT();
 		AssertChipSelect();
-		ENC100_SET_ADDR_IO(wAddress>>1);
+		ENC100_SI_RD_RW_IO = 0;
+		ENC100_SET_ADDR_IO(wAddress);
 		while(wLength--)
 		{
-			ENC100_SET_AD_IO(*vData++);
+			ENC100_SET_AD_IOL(*vData++);
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			ENC100_SO_WR_B0SEL_EN_IO = 0;
 		}
@@ -2127,7 +2289,7 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	}
 	#elif ENC100_INTERFACE_MODE == 5		// Bit bang PMP
 	{
-		ENC100_SET_AD_TRIS_OUT;
+		ENC100_SET_AD_TRIS_OUT();
 		AssertChipSelect();
 		ENC100_SET_AD_IO(wAddress);
 		ENC100_SCK_AL_IO = 1;
@@ -2142,7 +2304,7 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	}
 	#elif ENC100_INTERFACE_MODE == 6		// Bit bang PMP
 	{
-		ENC100_SET_AD_TRIS_OUT;
+		ENC100_SET_AD_TRIS_OUT();
 		AssertChipSelect();
 		ENC100_SI_RD_RW_IO = 0;
 		ENC100_SET_AD_IO(wAddress);
@@ -2158,18 +2320,14 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	}
 	#elif ENC100_INTERFACE_MODE == 9		// Bit bang PMP
 	{
-		ENC100_SET_AD_TRIS_OUT;
+		ENC100_SET_AD_TRIS_OUT();
 		AssertChipSelect();
-		ENC100_SET_AD_IO(wAddress>>1);
-		DelaySetupHold();
+		ENC100_SET_AD_IO(wAddress);
 		ENC100_SCK_AL_IO = 1;
-		DelaySetupHold();
 		ENC100_SCK_AL_IO = 0;
-		DelaySetupHold();
 		while(wLength--)
 		{
-			ENC100_SET_AD_IO(*vData++);
-			DelaySetupHold();
+			ENC100_SET_AD_IOL(*vData++);
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			DelaySetupHold();
 			ENC100_SO_WR_B0SEL_EN_IO = 0;
@@ -2178,19 +2336,15 @@ void WriteMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	}
 	#elif ENC100_INTERFACE_MODE == 10		// Bit bang PMP
 	{
-		ENC100_SET_AD_TRIS_OUT;
+		ENC100_SET_AD_TRIS_OUT();
 		AssertChipSelect();
 		ENC100_SI_RD_RW_IO = 0;
-		ENC100_SET_AD_IO(wAddress>>1);
-		DelaySetupHold();
+		ENC100_SET_AD_IO(wAddress);
 		ENC100_SCK_AL_IO = 1;
-		DelaySetupHold();
 		ENC100_SCK_AL_IO = 0;
-		DelaySetupHold();
 		while(wLength--)
 		{
-			ENC100_SET_AD_IO(*vData++);
-			DelaySetupHold();
+			ENC100_SET_AD_IOL(*vData++);
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			DelaySetupHold();
 			ENC100_SO_WR_B0SEL_EN_IO = 0;
@@ -2252,7 +2406,7 @@ void ReadMemory(WORD wAddress, BYTE *vData, WORD wLength)
 	{
 		volatile BYTE vDummy;
 
-		PMCONbits.PMPEN = 1;
+		ConfigurePMPModule();
 		AssertChipSelect();
 		PMADDR = wAddress++;
 		vDummy = PMDIN1;
@@ -2273,7 +2427,7 @@ void ReadMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		volatile WORD wDummy;
 	
 		wWORDAddress = wAddress>>1;
-		PMCONbits.PMPEN = 1;
+		ConfigurePMPModule();
 		AssertChipSelect();
 		PMADDR = wWORDAddress++;
 		wDummy = PMDIN1;
@@ -2333,9 +2487,7 @@ void ReadMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		DeassertChipSelect();
 		
 	#elif ENC100_INTERFACE_MODE == 3
-		if(wLength == 0u)
-			return;
-	
+		ENC100_SET_ADDR_TRIS_OUT();
 		ENC100_SET_AD_TRIS_IN();
 		AssertChipSelect();
 		if(wAddress & 0x1)		// Read from high byte if not WORD aligned
@@ -2370,9 +2522,7 @@ void ReadMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		DeassertChipSelect();
 		
 	#elif ENC100_INTERFACE_MODE == 4
-		if(wLength == 0u)
-			return;
-	
+		ENC100_SET_ADDR_TRIS_OUT();
 		ENC100_SET_AD_TRIS_IN();
 		AssertChipSelect();
 		ENC100_SI_RD_RW_IO = 1;
@@ -2412,11 +2562,11 @@ void ReadMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		AssertChipSelect();
 		while(wLength--)
 		{
-			ENC100_SET_AD_TRIS_OUT;
+			ENC100_SET_AD_TRIS_OUT();
 			ENC100_SET_AD_IO(wAddress);
 			ENC100_SCK_AL_IO = 1;
 			ENC100_SCK_AL_IO = 0;
-			ENC100_SET_AD_TRIS_IN;
+			ENC100_SET_AD_TRIS_IN();
 			ENC100_SI_RD_RW_IO = 1;
 			DelaySetupHold();
 			wAddress++;
@@ -2430,11 +2580,11 @@ void ReadMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		ENC100_SI_RD_RW_IO = 1;
 		while(wLength--)
 		{
-			ENC100_SET_AD_TRIS_OUT;
+			ENC100_SET_AD_TRIS_OUT();
 			ENC100_SET_AD_IO(wAddress);
 			ENC100_SCK_AL_IO = 1;
 			ENC100_SCK_AL_IO = 0;
-			ENC100_SET_AD_TRIS_IN;
+			ENC100_SET_AD_TRIS_IN();
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			DelaySetupHold();
 			wAddress++;
@@ -2444,114 +2594,98 @@ void ReadMemory(WORD wAddress, BYTE *vData, WORD wLength)
 		DeassertChipSelect();
 		
 	#elif ENC100_INTERFACE_MODE == 9
-		if(wLength == 0u)
-			return;
-	
+	{
 		AssertChipSelect();
 		if(wAddress & 0x1)		// Read from high byte if not WORD aligned
 		{
-			ENC100_SET_AD_TRIS_OUT;
+			ENC100_SET_AD_TRIS_OUT();
 			ENC100_SET_AD_IO(wAddress>>1);
 			ENC100_SCK_AL_IO = 1;
-			DelaySetupHold();
 			ENC100_SCK_AL_IO = 0;
-			DelaySetupHold();
-			ENC100_SET_AD_TRIS_IN;
+			ENC100_SET_AD_TRIS_IN();
 			ENC100_SI_RD_RW_IO = 1;
 			DelaySetupHold();
 			wAddress++;
 			wLength--;
-			*vData++ = ((BYTE*)&ENC100_GET_AD_IO())[1];
+			*vData++ = ENC100_GET_AD_IOH();
 			ENC100_SI_RD_RW_IO = 0;			
 		}
 		while(wLength >= 2u)	// Read all necessary WORDs
 		{
-			ENC100_SET_AD_TRIS_OUT;
+			ENC100_SET_AD_TRIS_OUT();
 			ENC100_SET_AD_IO(wAddress>>1);
 			ENC100_SCK_AL_IO = 1;
-			DelaySetupHold();
 			ENC100_SCK_AL_IO = 0;
-			DelaySetupHold();
-			ENC100_SET_AD_TRIS_IN;
+			ENC100_SET_AD_TRIS_IN();
 			ENC100_SI_RD_RW_IO = 1;
 			DelaySetupHold();
 			wAddress += 2;
 			wLength -= 2;
-			*vData++ = ((BYTE*)&ENC100_GET_AD_IO())[0];
-			*vData++ = ((BYTE*)&ENC100_GET_AD_IO())[1];
+			*vData++ = ENC100_GET_AD_IOL();
+			*vData++ = ENC100_GET_AD_IOH();
 			ENC100_SI_RD_RW_IO = 0;		
 		}
 		if(wLength)				// Read final low byte, if needed
 		{
-			ENC100_SET_AD_TRIS_OUT;
+			ENC100_SET_AD_TRIS_OUT();
 			ENC100_SET_AD_IO(wAddress>>1);
 			ENC100_SCK_AL_IO = 1;
-			DelaySetupHold();
 			ENC100_SCK_AL_IO = 0;
-			DelaySetupHold();
-			ENC100_SET_AD_TRIS_IN;
+			ENC100_SET_AD_TRIS_IN();
 			ENC100_SI_RD_RW_IO = 1;
 			DelaySetupHold();
-			*vData++ = ((BYTE*)&ENC100_GET_AD_IO())[0];
+			*vData++ = ENC100_GET_AD_IOL();
 			ENC100_SI_RD_RW_IO = 0;			
 		}
 		DeassertChipSelect();
-		
+	}
 	#elif ENC100_INTERFACE_MODE == 10
-		if(wLength == 0u)
-			return;
-	
+	{
 		AssertChipSelect();
 		ENC100_SI_RD_RW_IO = 1;
 		if(wAddress & 0x1)		// Read from high byte if not WORD aligned
 		{
-			ENC100_SET_AD_TRIS_OUT;
+			ENC100_SET_AD_TRIS_OUT();
 			ENC100_SET_AD_IO(wAddress>>1);
 			ENC100_SCK_AL_IO = 1;
-			DelaySetupHold();
 			ENC100_SCK_AL_IO = 0;
-			DelaySetupHold();
-			ENC100_SET_AD_TRIS_IN;
+			ENC100_SET_AD_TRIS_IN();
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			DelaySetupHold();
 			wAddress++;
 			wLength--;
-			*vData++ = ((BYTE*)&ENC100_GET_AD_IO())[1];
+			*vData++ = ENC100_GET_AD_IOH();
 			ENC100_SO_WR_B0SEL_EN_IO = 0;			
 		}
 		while(wLength >= 2u)	// Read all necessary WORDs
 		{
-			ENC100_SET_AD_TRIS_OUT;
+			ENC100_SET_AD_TRIS_OUT();
 			ENC100_SET_AD_IO(wAddress>>1);
 			ENC100_SCK_AL_IO = 1;
-			DelaySetupHold();
 			ENC100_SCK_AL_IO = 0;
-			DelaySetupHold();
-			ENC100_SET_AD_TRIS_IN;
+			ENC100_SET_AD_TRIS_IN();
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			DelaySetupHold();
 			wAddress += 2;
 			wLength -= 2;
-			*vData++ = ((BYTE*)&ENC100_GET_AD_IO())[0];
-			*vData++ = ((BYTE*)&ENC100_GET_AD_IO())[1];
+			*vData++ = ENC100_GET_AD_IOL();
+			*vData++ = ENC100_GET_AD_IOH();
 			ENC100_SO_WR_B0SEL_EN_IO = 0;		
 		}
 		if(wLength)				// Read final low byte, if needed
 		{
-			ENC100_SET_AD_TRIS_OUT;
+			ENC100_SET_AD_TRIS_OUT();
 			ENC100_SET_AD_IO(wAddress>>1);
 			ENC100_SCK_AL_IO = 1;
-			DelaySetupHold();
 			ENC100_SCK_AL_IO = 0;
-			DelaySetupHold();
-			ENC100_SET_AD_TRIS_IN;
+			ENC100_SET_AD_TRIS_IN();
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			DelaySetupHold();
-			*vData++ = ((BYTE*)&ENC100_GET_AD_IO())[0];
+			*vData++ = ENC100_GET_AD_IOL();
 			ENC100_SO_WR_B0SEL_EN_IO = 0;			
 		}
 		DeassertChipSelect();
-		
+	}
 	#else // SPI mode
 	{
 		WORD w;
@@ -2610,7 +2744,7 @@ void ReadMemoryWindow(BYTE vWindow, BYTE *vData, WORD wLength)
 		ENC100_ISR_ENABLE = 0;
 	#endif
 	
-	#if (ENC100_INTERFACE_MODE == 1) || (ENC100_INTERFACE_MODE == 2) || (ENC100_INTERFACE_MODE == 5) || (ENC100_INTERFACE_MODE == 6) || defined(ENC100_BIT_BANG_PMP)
+	#if (ENC100_INTERFACE_MODE == 1) || (ENC100_INTERFACE_MODE == 2) || (ENC100_INTERFACE_MODE == 5) || (ENC100_INTERFACE_MODE == 6)
 		wAddress = EUDADATA;
 		if(vWindow & GP_WINDOW)
 			wAddress = EGPDATA;
@@ -2628,7 +2762,7 @@ void ReadMemoryWindow(BYTE vWindow, BYTE *vData, WORD wLength)
 	{
 		volatile BYTE vDummy;
 
-		PMCONbits.PMPEN = 1;
+		ConfigurePMPModule();
 		AssertChipSelect();
 		PMADDR = wAddress;
 		vDummy = PMDIN1;
@@ -2670,9 +2804,10 @@ void ReadMemoryWindow(BYTE vWindow, BYTE *vData, WORD wLength)
 		}
 		DeassertChipSelect();
 	#elif ENC100_INTERFACE_MODE == 3
+		ENC100_SET_ADDR_TRIS_OUT();
 		ENC100_SET_AD_TRIS_IN();
 		AssertChipSelect();
-		ENC100_SET_ADDR_IO(wAddress>>1);
+		ENC100_SET_ADDR_IO(wAddress);
 		while(wLength--)
 		{
 			ENC100_SI_RD_RW_IO = 1;
@@ -2682,10 +2817,11 @@ void ReadMemoryWindow(BYTE vWindow, BYTE *vData, WORD wLength)
 		}
 		DeassertChipSelect();
 	#elif ENC100_INTERFACE_MODE == 4
+		ENC100_SET_ADDR_TRIS_OUT();
 		ENC100_SET_AD_TRIS_IN();
 		AssertChipSelect();
 		ENC100_SI_RD_RW_IO = 1;
-		ENC100_SET_ADDR_IO(wAddress>>1);
+		ENC100_SET_ADDR_IO(wAddress);
 		while(wLength--)
 		{
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
@@ -2696,11 +2832,11 @@ void ReadMemoryWindow(BYTE vWindow, BYTE *vData, WORD wLength)
 		DeassertChipSelect();
 	#elif ENC100_INTERFACE_MODE == 5
 		AssertChipSelect();
-		ENC100_SET_AD_TRIS_OUT;
+		ENC100_SET_AD_TRIS_OUT();
 		ENC100_SET_AD_IO(wAddress);
 		ENC100_SCK_AL_IO = 1;
 		ENC100_SCK_AL_IO = 0;
-		ENC100_SET_AD_TRIS_IN;
+		ENC100_SET_AD_TRIS_IN();
 		while(wLength--)
 		{
 			ENC100_SI_RD_RW_IO = 1;
@@ -2712,11 +2848,11 @@ void ReadMemoryWindow(BYTE vWindow, BYTE *vData, WORD wLength)
 	#elif ENC100_INTERFACE_MODE == 6
 		AssertChipSelect();
 		ENC100_SI_RD_RW_IO = 1;
-		ENC100_SET_AD_TRIS_OUT;
+		ENC100_SET_AD_TRIS_OUT();
 		ENC100_SET_AD_IO(wAddress);
 		ENC100_SCK_AL_IO = 1;
 		ENC100_SCK_AL_IO = 0;
-		ENC100_SET_AD_TRIS_IN;
+		ENC100_SET_AD_TRIS_IN();
 		while(wLength--)
 		{
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
@@ -2727,36 +2863,32 @@ void ReadMemoryWindow(BYTE vWindow, BYTE *vData, WORD wLength)
 		DeassertChipSelect();
 	#elif ENC100_INTERFACE_MODE == 9
 		AssertChipSelect();
-		ENC100_SET_AD_TRIS_OUT;
-		ENC100_SET_AD_IO(wAddress>>1);
+		ENC100_SET_AD_TRIS_OUT();
+		ENC100_SET_AD_IO(wAddress);
 		ENC100_SCK_AL_IO = 1;
-		DelaySetupHold();
 		ENC100_SCK_AL_IO = 0;
-		DelaySetupHold();
-		ENC100_SET_AD_TRIS_IN;
+		ENC100_SET_AD_TRIS_IN();
 		while(wLength--)
 		{
 			ENC100_SI_RD_RW_IO = 1;
 			DelaySetupHold();
-			*vData++ = ((BYTE*)&ENC100_GET_AD_IO())[0];
+			*vData++ = ENC100_GET_AD_IOL();
 			ENC100_SI_RD_RW_IO = 0;			
 		}
 		DeassertChipSelect();
 	#elif ENC100_INTERFACE_MODE == 10
 		AssertChipSelect();
 		ENC100_SI_RD_RW_IO = 1;
-		ENC100_SET_AD_TRIS_OUT;
-		ENC100_SET_AD_IO(wAddress>>1);
+		ENC100_SET_AD_TRIS_OUT();
+		ENC100_SET_AD_IO(wAddress);
 		ENC100_SCK_AL_IO = 1;
-		DelaySetupHold();
 		ENC100_SCK_AL_IO = 0;
-		DelaySetupHold();
-		ENC100_SET_AD_TRIS_IN;
+		ENC100_SET_AD_TRIS_IN();
 		while(wLength--)
 		{
 			ENC100_SO_WR_B0SEL_EN_IO = 1;
 			DelaySetupHold();
-			*vData++ = ((BYTE*)&ENC100_GET_AD_IO())[0];
+			*vData++ = ENC100_GET_AD_IOL();
 			ENC100_SO_WR_B0SEL_EN_IO = 0;			
 		}
 		DeassertChipSelect();
@@ -3246,11 +3378,97 @@ void WritePHYReg(BYTE Register, WORD Data)
 
 
 
+/*****************************************************************************
+  Function:
+	static void ToggleCRYPTEN(void)
+
+  Summary:
+	Toggles the CRYPTEN (EIR<15>) cryptographic enable bit in an errata safe 
+	way.
+
+  Description:
+	Due to an ENC424J600/624J600 Rev. A2 silicon errata, it is not possible to 
+	set or clear the CRYPTEN bit (EIR<15>) by using the BFSReg() or BFCReg() 
+	functions.  Instead a register write to the volatile EIR interrupt flags 
+	register is required.  This function reads EIR, toggles the CRYPTEN state, 
+	and writes the value back to EIR in a manner that does not destroy or 
+	glitch the interrupt states.
+
+  Precondition:
+	None
+
+  Parameters:
+	None
+
+  Returns:
+	None
+  ***************************************************************************/
+static void ToggleCRYPTEN(void)
+{
+	WORD wLinkStat;
+	WORD wInterruptEnable;
+	
+	// About to do read-modify-write to interrupt flags - disable interrupts 
+	// temporarily.
+	wInterruptEnable = ReadReg(EIE);
+	if(wInterruptEnable & EIE_INTIE)
+		BFCReg(EIE, EIE_INTIE);
+		
+	// Get current link status so that we can regenerate LINKIF if it is missed
+	wLinkStat = ReadReg(ESTAT);
+	
+	#if(ENC100_INTERFACE_MODE == 0)	// SPI
+	{
+		BYTE i;
+		
+		ReadN(RCR | EIRH, &i, 1);	// Read EIR high byte only
+		i ^= 0x80;					// Modify - toggle CRYPTEN	
+		WriteN(WCR | EIRH, &i, 1);	// Write EIR high byte only
+	}
+	#elif(ENC100_INTERFACE_MODE == 1) || (ENC100_INTERFACE_MODE == 2) || (ENC100_INTERFACE_MODE == 5) || (ENC100_INTERFACE_MODE == 6) 	// 8-bit PSP modes
+	{
+		BYTE i;
+		
+		ReadMemory(EIRH, &i, 1);	// Read EIR high byte only
+		i ^= 0x80;					// Modify - toggle CRYPTEN	
+		WriteMemory(EIRH, &i, 1);	// Write EIR high byte only
+	}
+	#else	// 16-bit PSP
+	{
+		WORD w;
+		
+		// Wait for any pending transmit and DMA operations to complete so that 
+		// the interrupt flags get set appropriately
+		while(ReadReg(ECON1) & (ECON1_DMAST | ECON1_TXRTS));
+
+		// Turn on/off crypto enable
+		ReadMemory(EIR, (BYTE*)&w, 2);	// Read EIR
+		w ^= EIR_CRYPTEN;				// Modify - set CRYPTEN	
+		WriteMemory(EIR, (BYTE*)&w, 2);	// Write EIR - has to be 16 bits
+		
+		// Regenerate packet counter full interrupt flag, PCFULIF, if it was 
+		// missed (unlikley but possible) 
+		if((ReadReg(ESTAT) & 0xFFu) == 0xFFu)
+			BFSReg(EIR, EIR_PCFULIF);
+	}
+	#endif
+
+	// Generate link change interrupt if the status has changed while we were 
+	// doing the read-modify-write operation (unlikely but possible)
+	if((ReadReg(ESTAT) ^ wLinkStat) & ESTAT_PHYLNK)
+		BFSReg(EIR, EIR_LINKIF);
+		
+	// Restore interrupts
+	if(wInterruptEnable & EIE_INTIE)
+		BFSReg(EIE, EIE_INTIE);
+}
+
+
 /****************************************************************************
   Section:
 	Global RSA Variables
   ***************************************************************************/
-#if defined(STACK_USE_SSL_SERVER) || defined(STACK_USE_SSL_CLIENT)
+#if (defined(STACK_USE_SSL_SERVER) || defined(STACK_USE_SSL_CLIENT)) && (SSL_RSA_CLIENT_SIZE <= 1024)
 
 static SM_RSA smRSA;					// State machine variable
 static BYTE keyLength;					// Length of the input key
@@ -3277,14 +3495,12 @@ void RSAInit(void)
 
 /*****************************************************************************
   Function:
-	BOOL RSABeginUsage(RSA_OP op, BYTE vKeyByteLen)
+	BOOL RSABeginUsage(RSA_OP op, WORD vKeyByteLen)
 
 Same
   ***************************************************************************/
-BOOL RSABeginUsage(RSA_OP op, BYTE vKeyByteLen)
+BOOL RSABeginUsage(RSA_OP op, WORD vKeyByteLen)
 {
-	WORD oldPtr;
-	
 	if(smRSA != SM_RSA_IDLE)
 		return FALSE;
 
@@ -3302,30 +3518,36 @@ BOOL RSABeginUsage(RSA_OP op, BYTE vKeyByteLen)
 		smRSA = SM_RSA_ENCRYPT_START;
 
 		// Turn on Modular Exponentiation hardware engine
-		BFSReg(EIR, EIR_CRYPTEN);
-	}	
+		if(!(ReadReg(EIR) & EIR_CRYPTEN))
+			ToggleCRYPTEN();
+	}
+#if defined(STACK_USE_SSL_SERVER) || defined(STACK_USE_RSA_DECRYPT)
 	else if(op == RSA_OP_DECRYPT)
 	{
+		WORD oldPtr;
+
 		smRSA = SM_RSA_DECRYPT_START;
 
 		// Turn on Modular Exponentiation hardware engine
-		BFSReg(EIR, EIR_CRYPTEN);
-			    
+		if(!(ReadReg(EIR) & EIR_CRYPTEN))
+			ToggleCRYPTEN();
+
 	    // Copy the decryption key and DMA into palce
 	    oldPtr = MACSetWritePtr(BASE_CRYPTOB_ADDR);
 	    MACPutROMArray(SSL_D, keyLength);
 	    MACMemCopyAsync(ENC100_MODEX_E, BASE_CRYPTOB_ADDR, 128);
 	    while(!MACIsMemCopyDone());
-	    
+
 		// Copy the modulus and DMA into palce
 		MACSetWritePtr(BASE_CRYPTOB_ADDR);
 	    MACPutROMArray(SSL_N, keyLength);
 	    MACMemCopyAsync(ENC100_MODEX_M, BASE_CRYPTOB_ADDR, 128);
 	    while(!MACIsMemCopyDone());
-	    
+
 		// Restore the write pointer
 		MACSetWritePtr(oldPtr);
 	}
+#endif
 	else
 		return FALSE;
 
@@ -3344,16 +3566,17 @@ void RSAEndUsage(void)
 	smRSA = SM_RSA_IDLE;
 
 	// Turn off Modular Exponentiation hardware engine to save power
-	BFCReg(EIR, EIR_CRYPTEN);
+	if(ReadReg(EIR) & EIR_CRYPTEN)
+		ToggleCRYPTEN();
 }
 
 /*****************************************************************************
   Function:
-	void RSASetData(BYTE* data, BYTE len, RSA_DATA_FORMAT format)
+	void RSASetData(BYTE* data, WORD len, RSA_DATA_FORMAT format)
 
 Replaced
   ***************************************************************************/
-void RSASetData(BYTE* data, BYTE len, RSA_DATA_FORMAT format)
+void RSASetData(BYTE* data, WORD len, RSA_DATA_FORMAT format)
 {
 	WORD oldPtr;
 	BYTE i;
@@ -3364,13 +3587,43 @@ void RSASetData(BYTE* data, BYTE len, RSA_DATA_FORMAT format)
 		
 	// Set the write pointer to reserved crypto area
     oldPtr = MACSetWritePtr(BASE_CRYPTOB_ADDR);
+
+	// Pad the input data according to PKCS #1 Block 2 if doing an encryption 
+	// operation
+	#if defined(STACK_USE_SSL_CLIENT) || defined(STACK_USE_RSA_ENCRYPT)
+	{
+		BYTE j;
+		
+		if(smRSA == SM_RSA_ENCRYPT_START)
+		{
+			if(len < keyLength-4)
+			{
+				MACPut(0x00);
+				MACPut(0x02);
+				for(i = len + 3; i < keyLength; i++)
+				{
+					do
+					{
+						j = RandomGet();
+					} while(j == 0x00u);
+					MACPut(j);
+				}
+				MACPut(0x00);
+			}
+		}
+	}
+	#endif
     
-    // Zero-pad the input, copy data, and DMA into palce
-    for(i = len; i < keyLength-len; i++)
-    	MACPut(0x00);
+    // Left zero-pad the input for decrypt operations
+    if(smRSA == SM_RSA_DECRYPT_START)
+    {
+	    for(i = len; i < keyLength; i++)
+	    	MACPut(0x00);
+	}
+	
+	// Copy data into ENCX24J600 and DMA into ModEx engine
     MACPutArray(data, len);
     MACMemCopyAsync(ENC100_MODEX_X, BASE_CRYPTOB_ADDR, 128);
-    while(!MACIsMemCopyDone());
 
 	// Restore the write pointer
 	MACSetWritePtr(oldPtr);
@@ -3378,6 +3631,9 @@ void RSASetData(BYTE* data, BYTE len, RSA_DATA_FORMAT format)
 	// Decrypt operations happen in place
 	if(smRSA == SM_RSA_DECRYPT_START)
 		RSASetResult(data, format);
+
+	// Wait for DMA engine to finish copying data into ModEx engine
+    while(!MACIsMemCopyDone());
 }
 
 /*****************************************************************************
@@ -3415,14 +3671,16 @@ void RSASetE(BYTE* data, BYTE len, RSA_DATA_FORMAT format)
     oldPtr = MACSetWritePtr(BASE_CRYPTOB_ADDR);
     
     // Zero-pad the input, copy data, and DMA into palce
-    for(i = len; i < keyLength-len; i++)
+    for(i = len; i < keyLength; i++)
     	MACPut(0x00);
     MACPutArray(data, len);
     MACMemCopyAsync(ENC100_MODEX_E, BASE_CRYPTOB_ADDR, 128);
-    while(!MACIsMemCopyDone());
     
 	// Restore the write pointer
 	MACSetWritePtr(oldPtr);
+
+	// Wait for DMA copy to ModEx to complete
+    while(!MACIsMemCopyDone());
 }
 #endif
 
@@ -3447,10 +3705,12 @@ void RSASetN(BYTE* data, RSA_DATA_FORMAT format)
     // Copy data and DMA into palce
     MACPutArray(data, keyLength);
     MACMemCopyAsync(ENC100_MODEX_M, BASE_CRYPTOB_ADDR, 128);
-    while(!MACIsMemCopyDone());
     
 	// Restore the write pointer
 	MACSetWritePtr(oldPtr);
+
+	// Wait for DMA copy to ModEx to complete
+    while(!MACIsMemCopyDone());
 }
 #endif
 
@@ -3535,7 +3795,8 @@ Not Needed
 
 
 
-/* // A function potentially useful for debugging, but a waste of code otherwise
+#ifdef ENC100_DEBUG
+// A function potentially useful for debugging, but a waste of code otherwise
 void ENC100DumpState(void)
 {
 	WORD w;
@@ -3579,6 +3840,6 @@ void ENC100DumpState(void)
 	}
 	printf("\r\n\r\n");
 }
-*/
+#endif
 
 #endif //#if defined(ENC100_INTERFACE_MODE)

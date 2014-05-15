@@ -9,7 +9,7 @@
  *********************************************************************
  * FileName:        TCP.c
  * Dependencies:    IP, Tick, Ethernet/WiFi (ENC28J60.c, ETH97J60.c, 
- *					ENCX24J600.c, or ZG2100.c), ARP (optional), 
+ *					ENCX24J600.c, or WFMac.c), ARP (optional), 
  *					DNS (optional)
  * Processor:       PIC18, PIC24F, PIC24H, dsPIC30F, dsPIC33F, PIC32
  * Compiler:        Microchip C32 v1.05 or higher
@@ -73,8 +73,8 @@
 #define LOCAL_PORT_END_NUMBER   (5000u)
 
 // For debugging only.  Normal applications should never enable these
-//#define DEBUG_GENERATE_TX_LOSS		31129
-//#define DEBUG_GENERATE_RX_LOSS		32113
+//#define DEBUG_GENERATE_TX_LOSS		62257
+//#define DEBUG_GENERATE_RX_LOSS		64225
 
 // A lot of pointer dereference code can be removed if you 
 // locally copy TCBStubs to an absolute memory location.
@@ -96,23 +96,37 @@
 	#undef TCP_OPTIMIZE_FOR_SIZE
 #endif
 
-// TCP Maximum Segment Size (TX and RX)
-#define TCP_MAX_SEG_SIZE			(536u)
+// TCP Maximum Segment Size for TX.  The TX maximum segment size is actually 
+// govered by the remote node's MSS option advirtised during connection 
+// establishment.  However, if the remote node specifies an unhandlably large 
+// MSS (ex: > Ethernet MTU), this define sets a hard limit so that we don't 
+// cause any TX buffer overflows.  If the remote node does not advirtise a MSS 
+// option, all TX segments are fixed at 536 bytes maximum.
+#define TCP_MAX_SEG_SIZE_TX			(1460u)
+
+// TCP Maximum Segment Size for RX.  This value is advirtised during connection 
+// establishment and the remote node should obey it.  This should be set to 536 
+// to avoid IP layer fragmentation from causing packet loss.  However, raising 
+// its value can enhance performance at the (small) risk of introducing 
+// incompatibility with certain special remote nodes (ex: ones connected via a 
+// slow dial up modem).
+#define TCP_MAX_SEG_SIZE_RX			(536u)
 
 // TCP Timeout and retransmit numbers
-#define TCP_START_TIMEOUT_VAL   	((TICK)TICK_SECOND*1)	// Timeout to retransmit unacked data
-#define TCP_DELAYED_ACK_TIMEOUT		((TICK)TICK_SECOND/10)	// Timeout for delayed-acknowledgement algorithm
-#define TCP_FIN_WAIT_2_TIMEOUT		((TICK)TICK_SECOND*5)	// Timeout for FIN WAIT 2 state
-#define TCP_KEEP_ALIVE_TIMEOUT		((TICK)TICK_SECOND*10)	// Timeout for keep-alive messages when no traffic is sent
-#define TCP_CLOSE_WAIT_TIMEOUT		((TICK)TICK_SECOND/5)	// Timeout for the CLOSE_WAIT state
+#define TCP_START_TIMEOUT_VAL   	((DWORD)TICK_SECOND*1)	// Timeout to retransmit unacked data
+#define TCP_DELAYED_ACK_TIMEOUT		((DWORD)TICK_SECOND/10)	// Timeout for delayed-acknowledgement algorithm
+#define TCP_FIN_WAIT_2_TIMEOUT		((DWORD)TICK_SECOND*5)	// Timeout for FIN WAIT 2 state
+#define TCP_KEEP_ALIVE_TIMEOUT		((DWORD)TICK_SECOND*10)	// Timeout for keep-alive messages when no traffic is sent
+#define TCP_CLOSE_WAIT_TIMEOUT		((DWORD)TICK_SECOND/5)	// Timeout for the CLOSE_WAIT state
 #define TCP_MAX_RETRIES			    (5u)					// Maximum number of retransmission attempts
 #define TCP_MAX_UNACKED_KEEP_ALIVES	(6u)					// Maximum number of keep-alive messages that can be sent without receiving a response before automatically closing the connection
 #define TCP_MAX_SYN_RETRIES			(2u)	// Smaller than all other retries to reduce SYN flood DoS duration
 
-#define TCP_AUTO_TRANSMIT_TIMEOUT_VAL	(TICK_SECOND/25ull)	// Timeout before automatically tranmitting unflushed data
+#define TCP_AUTO_TRANSMIT_TIMEOUT_VAL	(TICK_SECOND/25ull)	// Timeout before automatically transmitting unflushed data
+#define TCP_WINDOW_UPDATE_TIMEOUT_VAL	(TICK_SECOND/5ull)	// Timeout before automatically transmitting a window update due to a TCPGet() or TCPGetArray() function call
 
 #define TCP_SYN_QUEUE_MAX_ENTRIES	(3u) 					// Number of TCP RX SYN packets to save if they cannot be serviced immediately
-#define TCP_SYN_QUEUE_TIMEOUT		((TICK)TICK_SECOND*3)	// Timeout for when SYN queue entries are deleted if unserviceable
+#define TCP_SYN_QUEUE_TIMEOUT		((DWORD)TICK_SECOND*3)	// Timeout for when SYN queue entries are deleted if unserviceable
 
 /****************************************************************************
   Section:
@@ -127,7 +141,7 @@
 #define URG     (0x20)		// Urgent Flag as defined in RFC
 
 // TCP Header Data Structure
-typedef struct _TCP_HEADER
+typedef struct
 {
 	WORD    SourcePort;		// Local port number
 	WORD    DestPort;		// Remote port number
@@ -163,7 +177,7 @@ typedef struct _TCP_HEADER
 #define TCP_OPTIONS_END_OF_LIST     (0x00u)		// End of List TCP Option Flag
 #define TCP_OPTIONS_NO_OP           (0x01u)		// No Op TCP Option
 #define TCP_OPTIONS_MAX_SEG_SIZE    (0x02u)		// Maximum segment size TCP flag
-typedef struct _TCP_OPTIONS
+typedef struct
 {
 	BYTE        Kind;							// Type of option
 	BYTE        Length;							// Length
@@ -260,6 +274,10 @@ static BOOL FindMatchingSocket(TCP_HEADER* h, NODE_INFO* remote);
 static void SwapTCPHeader(TCP_HEADER* header);
 static void CloseSocket(void);
 static void SyncTCB(void);
+
+#if defined(WF_CS_TRIS)
+UINT16 WFGetTCBSize(void);
+#endif
 
 // Indicates if this packet is a retransmission (no reset) or a new packet (reset required)
 #define SENDTCP_RESET_TIMERS	0x01
@@ -404,7 +422,11 @@ void TCPInit(void)
 				wCurrentETHAddress += sizeof(TCB) + wTXSize+1 + wRXSize+1;
 				// Do a sanity check to ensure that we aren't going to use memory that hasn't been allocated to us.
 				// If your code locks up right here, it means you've incorrectly allocated your TCP socket buffers in TCPIPConfig.h.  See the TCP memory allocation section.  More RAM needs to be allocated to the base memory mediums, or the individual sockets TX and RX FIFOS and socket quantiy needs to be shrunken.
+#if defined(WF_CS_TRIS)
+				while(wCurrentETHAddress > TCP_ETH_RAM_BASE_ADDRESS + WFGetTCBSize()/*TCP_ETH_RAM_SIZE*/);
+#else
 				while(wCurrentETHAddress > TCP_ETH_RAM_BASE_ADDRESS + TCP_ETH_RAM_SIZE);
+#endif
 				break;
 			#endif
 				
@@ -454,22 +476,20 @@ void TCPInit(void)
   ***************************************************************************/
 
 
-/****************************************************************************
+/*****************************************************************************
   Function:
-      TCP_SOCKET TCPOpen(DWORD dwRemoteHost,
-                          BYTE vRemoteHostType,
-                          WORD wPort,
-                          BYTE vSocketPurpose)
+	TCP_SOCKET TCPOpen(DWORD dwRemoteHost, BYTE vRemoteHostType, WORD wPort, BYTE vSocketPurpose)
     
   Summary:
     Opens a TCP socket for listening or as a client.
-    
+
   Description:
     Provides a unified method for opening TCP sockets. This function can
     open both client and server sockets. For client sockets, it can accept
-    host name string to query in DNS, and IP address as a string, an IP
-    address in binary form, or a previously resolved NODE_INFO structure.
-    When a host name or IP address only is provided, the TCP module will
+    a host name string to query in DNS, an IP address as a string, an IP
+    address in binary form, or a previously resolved NODE_INFO structure
+    containing the remote IP address and associated MAC address. When a
+    host name or IP address only is provided, the TCP module will
     internally perform the necessary DNS and/or ARP resolution steps before
     reporting that the TCP socket is connected (via a call to
     TCPISConnected returning TRUE). Server sockets ignore this destination
@@ -477,18 +497,19 @@ void TCPInit(void)
     
     The vSocketPurpose field allows sockets to be opened with varying
     buffer size parameters and memory storage mediums. This field
-    corresponds to pre-defined sockets types in TCPIPConfig.h or the
-    TCPIPConfig utility.
+    corresponds to pre-defined sockets allocated in the
+    TCPSocketInitializer[] array in TCPIPConfig.h. The TCPIPConfig.h file
+    can be edited using the TCP/IP Configuration Wizard.
     
     Sockets are statically allocated on boot, but can be claimed with this
-    \function and freed using TCPDisconnect (for client sockets). Server
-    sockets are opened permanently for the duration of the application.
-    Calls to TCPDisconnect will only release the socket to the listening
-    state.
-    
+    \function and freed using TCPDisconnect or TCPClose (for client
+    sockets). Server sockets can be freed using TCPClose only (calls to
+    TCPDisconnect will return server sockets to the listening state,
+    allowing reuse).
+
   Conditions:
     TCP is initialized.
-    
+
   Input:
     dwRemoteHost -     For client sockets only. Provide a pointer to a
                        null\-terminated string of the remote host name (ex\:
@@ -499,30 +520,62 @@ void TCPInit(void)
                        MAC address specified. If a string is provided, note
                        that it must be statically allocated in memory and
                        cannot be modified or deallocated until
-                       TCPIsConnected returns TRUE. This parameter is
+                       TCPIsConnected returns TRUE.<p />This parameter is
                        ignored for server sockets.
-    vRemoteHostType -  TCP_OPEN_SERVER, TCP_OPEN_RAM_HOST,
-                       TCP_OPEN_ROM_HOST, TCP_OPEN_IP_ADDRESS, or
-                       TCP_OPEN_NODE_INFO.
-    wPort -            For client sockets, the remote TCP port to which a
-                       connection should be made. For server sockets, the
-                       local TCP port on which to listen for connections.
+    vRemoteHostType -  Any one of the following flags to identify the
+                       meaning of the dwRemoteHost parameter\:
+                       * TCP_OPEN_SERVER &#45; Open a server socket and
+                         ignore the dwRemoteHost parameter.
+                       * TCP_OPEN_RAM_HOST &#45; Open a client socket and
+                         connect it to a remote host who's name is stored as a
+                         null terminated string in a RAM array. Ex\:
+                         "www.microchip.com" or "192.168.0.123" (BYTE&#42;
+                         type)
+                       * TCP_OPEN_ROM_HOST &#45; Open a client socket and
+                         connect it to a remote host who's name is stored as a
+                         null terminated string in a literal string or ROM
+                         array. Ex\: "www.microchip.com" or "192.168.0.123"
+                         (ROM BYTE&#42; type)
+                       * TCP_OPEN_IP_ADDRESS &#45; Open a client socket and
+                         connect it to a remote IP address. Ex\: 0x7B01A8C0
+                         for 192.168.1.123 (DWORD type). Note that the byte
+                         ordering is big endian.
+                       * TCP_OPEN_NODE_INFO &#45; Open a client socket and
+                         connect it to a remote IP and MAC addresses pair
+                         stored in a NODE_INFO structure. dwRemoteHost must be
+                         a pointer to the NODE_INFO structure. This option is
+                         provided for backwards compatibility with
+                         applications built against prior stack versions that
+                         only implemented the TCPConnect() function. It can
+                         also be used to skip DNS and ARP resolution steps if
+                         connecting to a remote node which you've already
+                         connected to and have cached addresses for.
+    wPort -            TCP port to listen on or connect to\:
+                       * Client sockets &#45; the remote TCP port to which a
+                         connection should be made. The local port for client
+                         sockets will be automatically picked by the TCP
+                         module.
+                       * Server sockets &#45; the local TCP port on which to
+                         listen for connections.
     vSocketPurpose -   Any of the TCP_PURPOSE_* constants defined in
-                       TCPIPConfig.h or the TCPIPConfig utility.
+                       TCPIPConfig.h or the TCPIPConfig utility (see
+                       TCPSocketInitializer[] array).
 
   Return Values:
     INVALID_SOCKET -  No sockets of the specified type were available to be
                       opened.
     Otherwise -       A TCP_SOCKET handle. Save this handle and use it when
                       calling all other TCP APIs.
-  
+
   Remarks:
     This function replaces the old TCPConnect and TCPListen functions.
     
     If TCP_OPEN_RAM_HOST or TCP_OPEN_ROM_HOST are used for the destination
-    type, the DNS client module must also be enabled.
-    
+    type, the DNS client module must also be enabled (STACK_USE_DNS must be
+    defined in TCPIPConfig.h).
+
   Example:
+    \ \ 
     <code>
     // Open a server socket
     skt = TCPOpen(NULL, TCP_OPEN_SERVER, HTTP_PORT, TCP_PURPOSE_HTTP_SERVER);
@@ -530,14 +583,14 @@ void TCPInit(void)
     // Open a client socket to www.microchip.com
     // The double cast here prevents compiler warnings
     skt = TCPOpen((DWORD)(PTR_BASE)"www.microchip.com",
-                  	TCP_OPEN_ROM_HOST, 80, TCP_PURPOSE_DEFAULT);
+                    TCP_OPEN_ROM_HOST, 80, TCP_PURPOSE_DEFAULT);
     
     // Reopen a client socket without repeating DNS or ARP
     SOCKET_INFO cache = TCPGetSocketInfo(skt);  // Call with the old socket
-    skt = TCPOpen((DWORD)(PTR_BASE)&cache.remote, TCP_OPEN_NODE_INFO, 
-    				cache.remotePort.Val, TCP_PURPOSE_DEFAULT);
-    </code>                                                             
-  ****************************************************************************/
+    skt = TCPOpen((DWORD)(PTR_BASE)&amp;cache.remote, TCP_OPEN_NODE_INFO,
+                    cache.remotePort.Val, TCP_PURPOSE_DEFAULT);
+    </code>                                                    
+  *****************************************************************************/
 TCP_SOCKET TCPOpen(DWORD dwRemoteHost, BYTE vRemoteHostType, WORD wPort, BYTE vSocketPurpose)
 {
 	TCP_SOCKET hTCP;
@@ -556,6 +609,10 @@ TCP_SOCKET TCPOpen(DWORD dwRemoteHost, BYTE vRemoteHostType, WORD wPort, BYTE vS
 		// See if this socket matches the desired type
 		if(MyTCB.vSocketPurpose != vSocketPurpose)
 			continue;
+
+		// Start out assuming worst case Maximum Segment Size (changes when MSS 
+		// option is received from remote node)
+		MyTCB.wRemoteMSS = 536;
 
 		// See if this is a server socket
 		if(vRemoteHostType == TCP_OPEN_SERVER)
@@ -669,6 +726,11 @@ TCP_SOCKET TCPOpen(DWORD dwRemoteHost, BYTE vRemoteHostType, WORD wPort, BYTE vS
   ***************************************************************************/
 BOOL TCPWasReset(TCP_SOCKET hTCP)
 {
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return TRUE;
+    }
+    
 	SyncTCBStub(hTCP);
 	
 	if(MyTCBStub.Flags.bSocketReset)
@@ -711,6 +773,11 @@ BOOL TCPWasReset(TCP_SOCKET hTCP)
   ***************************************************************************/
 BOOL TCPIsConnected(TCP_SOCKET hTCP)
 {
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return FALSE;
+    }
+    
 	SyncTCBStub(hTCP);
 	return (MyTCBStub.smState == TCP_ESTABLISHED);
 }
@@ -761,6 +828,11 @@ BOOL TCPIsConnected(TCP_SOCKET hTCP)
   ***************************************************************************/
 void TCPDisconnect(TCP_SOCKET hTCP)
 {
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return;
+    }
+    
 	SyncTCBStub(hTCP);
 
 	// Delete all data in the RX FIFO
@@ -802,8 +874,8 @@ void TCPDisconnect(TCP_SOCKET hTCP)
 
 			// Send the FIN.  This is done in a loop to ensure that if we have 
 			// more data wating in the TX FIFO than can be sent in a single 
-			// packet (due to the TCP_MAX_SEG_SIZE packet size limit), we will 
-			// keep generating more packets until either all data gets 
+			// packet (due to the remote Max Segment Size packet size limit), 
+			// we will keep generating more packets until either all data gets 
 			// transmitted or the remote node's receive window fills up.
 			do
 			{
@@ -818,8 +890,8 @@ void TCPDisconnect(TCP_SOCKET hTCP)
 		case TCP_CLOSE_WAIT:
 			// Send the FIN.  This is done in a loop to ensure that if we have 
 			// more data wating in the TX FIFO than can be sent in a single 
-			// packet (due to the TCP_MAX_SEG_SIZE packet size limit), we will 
-			// keep generating more packets until either all data gets 
+			// packet (due to the remote Max Segment Size packet size limit), 
+			// we will keep generating more packets until either all data gets 
 			// transmitted or the remote node's receive window fills up.
 			do
 			{
@@ -887,6 +959,11 @@ void TCPDisconnect(TCP_SOCKET hTCP)
   ***************************************************************************/
 void TCPClose(TCP_SOCKET hTCP)
 {
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return;
+    }
+    
 	SyncTCBStub(hTCP);
 	MyTCBStub.Flags.bServer = FALSE;
 	TCPDisconnect(hTCP);
@@ -920,6 +997,11 @@ SOCKET_INFO* TCPGetRemoteInfo(TCP_SOCKET hTCP)
 {
 	static SOCKET_INFO	RemoteInfo;
 
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return 0;
+    }
+    
 	SyncTCBStub(hTCP);
 	SyncTCB();
 	memcpy((void*)&RemoteInfo.remote, (void*)&MyTCB.remote, sizeof(NODE_INFO));
@@ -963,6 +1045,11 @@ SOCKET_INFO* TCPGetRemoteInfo(TCP_SOCKET hTCP)
   ***************************************************************************/
 void TCPFlush(TCP_SOCKET hTCP)
 {
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return;
+    }
+    
 	SyncTCBStub(hTCP);
 	SyncTCB();
 
@@ -1002,6 +1089,11 @@ WORD TCPIsPutReady(TCP_SOCKET hTCP)
 {
 	BYTE i;
 
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return 0;
+    }
+    
 	SyncTCBStub(hTCP);
 
 	i = MyTCBStub.smState;
@@ -1059,6 +1151,11 @@ BOOL TCPPut(TCP_SOCKET hTCP, BYTE byte)
 {
 	WORD wFreeTXSpace;
 
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return 0;
+    }
+    
 	SyncTCBStub(hTCP);
 
 	wFreeTXSpace = TCPIsPutReady(hTCP);
@@ -1138,6 +1235,11 @@ WORD TCPPutArray(TCP_SOCKET hTCP, BYTE* data, WORD len)
 	WORD wFreeTXSpace;
 	WORD wRightLen = 0;
 
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return 0;
+    }
+    
 	SyncTCBStub(hTCP);
 
 	wFreeTXSpace = TCPIsPutReady(hTCP);
@@ -1252,6 +1354,11 @@ WORD TCPPutROMArray(TCP_SOCKET hTCP, ROM BYTE* data, WORD len)
 	WORD wFreeTXSpace;
 	WORD wRightLen = 0;
 
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return 0;
+    }
+    
 	SyncTCBStub(hTCP);
 
 	wFreeTXSpace = TCPIsPutReady(hTCP);
@@ -1427,6 +1534,11 @@ WORD TCPGetTxFIFOFull(TCP_SOCKET hTCP)
 	WORD wDataLen;
 	WORD wFIFOSize;
 
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return 0;
+    }
+    
 	SyncTCBStub(hTCP);
 
 	// Calculate total usable FIFO size
@@ -1500,6 +1612,11 @@ void TCPDiscard(TCP_SOCKET hTCP)
   ***************************************************************************/
 WORD TCPIsGetReady(TCP_SOCKET hTCP)
 {
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return 0;
+    }
+    
 	SyncTCBStub(hTCP);
 		
 	if(MyTCBStub.rxHead >= MyTCBStub.rxTail)
@@ -1553,7 +1670,7 @@ BOOL TCPGet(TCP_SOCKET hTCP, BYTE* byte)
 	else if(!MyTCBStub.Flags.bTimer2Enabled)
 	{
 		MyTCBStub.Flags.bTimer2Enabled = TRUE;
-		MyTCBStub.eventTime2 = (WORD)TickGetDiv256() + TCP_AUTO_TRANSMIT_TIMEOUT_VAL/256ull;
+		MyTCBStub.eventTime2 = (WORD)TickGetDiv256() + TCP_WINDOW_UPDATE_TIMEOUT_VAL/256ull;
 	}
 
 
@@ -1563,22 +1680,23 @@ BOOL TCPGet(TCP_SOCKET hTCP, BYTE* byte)
 
 /*****************************************************************************
   Function:
-	WORD TCPGetArray(TCP_SOCKET hTCP, BYTE* data, WORD len)
+	WORD TCPGetArray(TCP_SOCKET hTCP, BYTE* buffer, WORD len)
 
   Description:
-	Reads an array from a TCP socket.
+	Reads an array of data bytes from a TCP socket's receive FIFO.  The data 
+	is removed from the FIFO in the process.
 
   Precondition:
 	TCP is initialized.
 
   Parameters:
 	hTCP - The socket from which data is to be read.
-	data - Pointer to the array to store data that was read.
+	buffer - Pointer to the array to store data that was read.
 	len  - Number of bytes to be read.
 
   Returns:
 	The number of bytes read from the socket.  If less than len, the
-	buffer became empty or the socket is not conected.
+	RX FIFO buffer became empty or the socket is not conected.
   ***************************************************************************/
 WORD TCPGetArray(TCP_SOCKET hTCP, BYTE* buffer, WORD len)
 {
@@ -1624,7 +1742,7 @@ WORD TCPGetArray(TCP_SOCKET hTCP, BYTE* buffer, WORD len)
 	// update will get sent to the remote node at some point
 	{
 		MyTCBStub.Flags.bTimer2Enabled = TRUE;
-		MyTCBStub.eventTime2 = (WORD)TickGetDiv256() + TCP_AUTO_TRANSMIT_TIMEOUT_VAL/256ull;
+		MyTCBStub.eventTime2 = (WORD)TickGetDiv256() + TCP_WINDOW_UPDATE_TIMEOUT_VAL/256ull;
 	}
 
 	return len;
@@ -1654,6 +1772,11 @@ WORD TCPGetRxFIFOFree(TCP_SOCKET hTCP)
 	WORD wDataLen;
 	WORD wFIFOSize;
 	
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return 0;
+    }
+    
 	SyncTCBStub(hTCP);
 	
 	// Calculate total usable FIFO size
@@ -1721,9 +1844,11 @@ WORD TCPPeekArray(TCP_SOCKET hTCP, BYTE *vBuffer, WORD wLen, WORD wStart)
 	WORD w;
 	WORD wBytesUntilWrap;
 
-	if(wLen == 0u)
-		return 0u;
-
+	if(hTCP >= TCP_SOCKET_COUNT || wLen == 0)
+    {
+        return 0;
+    }
+    
 	SyncTCBStub(hTCP);
 
 	// Find out how many bytes are in the RX FIFO and decrease read length 
@@ -1854,9 +1979,11 @@ WORD TCPFindArrayEx(TCP_SOCKET hTCP, BYTE* cFindArray, WORD wLen, WORD wStart, W
 	BOOL isFinding;
 	BYTE buffer[32];
 
-	if(wLen == 0u)
-		return 0u;
-
+	if(hTCP >= TCP_SOCKET_COUNT || wLen == 0)
+    {
+        return 0;
+    }
+    
 	SyncTCBStub(hTCP);
 
 	// Find out how many bytes are in the RX FIFO and return 
@@ -2028,9 +2155,11 @@ WORD TCPFindROMArrayEx(TCP_SOCKET hTCP, ROM BYTE* cFindArray, WORD wLen, WORD wS
 	BOOL isFinding;
 	BYTE buffer[32];
 
-	if(wLen == 0u)
-		return 0u;
-
+	if(hTCP >= TCP_SOCKET_COUNT || wLen == 0)
+    {
+        return 0;
+    }
+    
 	SyncTCBStub(hTCP);
 
 	// Find out how many bytes are in the RX FIFO and return 
@@ -2484,6 +2613,13 @@ void TCPTick(void)
 				// caller must detect it and do something.
 				vFlags = SYN;
 				bRetransmit = TRUE;
+
+				// Exponentially increase timeout until we reach TCP_MAX_RETRIES attempts then stay constant
+				if(MyTCB.retryCount >= (TCP_MAX_RETRIES - 1))
+				{
+					MyTCB.retryCount = TCP_MAX_RETRIES - 1;
+					MyTCB.retryInterval = TCP_START_TIMEOUT_VAL<<(TCP_MAX_RETRIES-1);
+				}
 				break;
 	
 			case TCP_SYN_RECEIVED:
@@ -2594,17 +2730,23 @@ void TCPTick(void)
 
 		if(vFlags)
 		{
+			// Transmit all unacknowledged data over again
 			if(bRetransmit)
 			{
 				// Set the appropriate retry time
 				MyTCB.retryCount++;
 				MyTCB.retryInterval <<= 1;
 		
-				// Transmit all unacknowledged data over again
-				// Roll back unacknowledged TX tail pointer to cause retransmit to occur
-				MyTCB.MySEQ -= (LONG)(SHORT)(MyTCB.txUnackedTail - MyTCBStub.txTail);
+				// Calculate how many bytes we have to roll back and retransmit
+				w = MyTCB.txUnackedTail - MyTCBStub.txTail;
 				if(MyTCB.txUnackedTail < MyTCBStub.txTail)
-					MyTCB.MySEQ -= (LONG)(SHORT)(MyTCBStub.bufferRxStart - MyTCBStub.bufferTxStart);
+					w += MyTCBStub.bufferRxStart - MyTCBStub.bufferTxStart;
+				
+				// Perform roll back of local SEQuence counter, remote window 
+				// adjustment, and cause all unacknowledged data to be 
+				// retransmitted by moving the unacked tail pointer.
+				MyTCB.MySEQ -= w;
+				MyTCB.remoteWindow += w;
 				MyTCB.txUnackedTail = MyTCBStub.txTail;		
 				SendTCP(vFlags, 0);
 			}
@@ -2699,7 +2841,7 @@ BOOL TCPProcess(NODE_INFO* remote, IP_ADDR* localIP, WORD len)
 
 #if defined(DEBUG_GENERATE_RX_LOSS)
 	// Throw RX packets away randomly
-	if(rand() > DEBUG_GENERATE_RX_LOSS)
+	if(LFSRRand() > DEBUG_GENERATE_RX_LOSS)
 	{
 		MACDiscardRx();
 		return TRUE;
@@ -2790,7 +2932,6 @@ static void SendTCP(BYTE vTCPFlags, BYTE vSendFlags)
 	TCP_OPTIONS     options;
 	PSEUDO_HEADER   pseudoHeader;
 	WORD 			len;
-	WORD			wEffectiveWindow;
 	
 	SyncTCB();
 
@@ -2826,37 +2967,18 @@ static void SendTCP(BYTE vTCPFlags, BYTE vSendFlags)
 		{
 			// All caught up on data TX, no real data for this packet
 			len = 0;
-
-			// If we are to transmit a FIN, make sure we can put one in this packet
-			if(MyTCBStub.Flags.bTXFIN)
-			{
-				if(MyTCB.remoteWindow)
-					vTCPFlags |= FIN;
-			}
 		}
 		else if(MyTCBStub.txHead > MyTCB.txUnackedTail)
 		{
 			len = MyTCBStub.txHead - MyTCB.txUnackedTail;
-			wEffectiveWindow = MyTCB.remoteWindow;
-			if(MyTCB.txUnackedTail >= MyTCBStub.txTail)
-				wEffectiveWindow -= MyTCB.txUnackedTail - MyTCBStub.txTail;
-			else
-				wEffectiveWindow -= (MyTCBStub.bufferRxStart - MyTCBStub.bufferTxStart) - (MyTCBStub.txTail - MyTCB.txUnackedTail);
 
-			if(len > wEffectiveWindow)
-				len = wEffectiveWindow;
+			if(len > MyTCB.remoteWindow)
+				len = MyTCB.remoteWindow;
 
-			if(len > TCP_MAX_SEG_SIZE)
+			if(len > MyTCB.wRemoteMSS)
 			{
-				len = TCP_MAX_SEG_SIZE;
+				len = MyTCB.wRemoteMSS;
 				MyTCBStub.Flags.bTXASAPWithoutTimerReset = 1;
-			}
-
-			// If we are to transmit a FIN, make sure we can put one in this packet
-			if(MyTCBStub.Flags.bTXFIN)
-			{
-				if((len != wEffectiveWindow) && (len != TCP_MAX_SEG_SIZE))
-					vTCPFlags |= FIN;
 			}
 
 			// Copy application data into the raw TX buffer
@@ -2868,26 +2990,13 @@ static void SendTCP(BYTE vTCPFlags, BYTE vSendFlags)
 			pseudoHeader.Length = MyTCBStub.bufferRxStart - MyTCB.txUnackedTail;
 			len = pseudoHeader.Length + MyTCBStub.txHead - MyTCBStub.bufferTxStart;
 
-			wEffectiveWindow = MyTCB.remoteWindow;
-			if(MyTCB.txUnackedTail >= MyTCBStub.txTail)
-				wEffectiveWindow -= MyTCB.txUnackedTail - MyTCBStub.txTail;
-			else
-				wEffectiveWindow -= (MyTCBStub.bufferRxStart - MyTCBStub.bufferTxStart) - (MyTCBStub.txTail - MyTCB.txUnackedTail);
-				
-			if(len > wEffectiveWindow)
-				len = wEffectiveWindow;
+			if(len > MyTCB.remoteWindow)
+				len = MyTCB.remoteWindow;
 
-			if(len > TCP_MAX_SEG_SIZE)
+			if(len > MyTCB.wRemoteMSS)
 			{
-				len = TCP_MAX_SEG_SIZE;
+				len = MyTCB.wRemoteMSS;
 				MyTCBStub.Flags.bTXASAPWithoutTimerReset = 1;
-			}
-
-			// If we are to transmit a FIN, make sure we can put one in this packet
-			if(MyTCBStub.Flags.bTXFIN)
-			{
-				if((len != wEffectiveWindow) && (len != TCP_MAX_SEG_SIZE))
-					vTCPFlags |= FIN;
 			}
 
 			if(pseudoHeader.Length > len)
@@ -2907,6 +3016,13 @@ static void SendTCP(BYTE vTCPFlags, BYTE vSendFlags)
 			if(MyTCB.txUnackedTail >= MyTCBStub.bufferRxStart)
 				MyTCB.txUnackedTail -= MyTCBStub.bufferRxStart-MyTCBStub.bufferTxStart;
 		}
+
+		// If we are to transmit a FIN, make sure we can put one in this packet
+		if(MyTCBStub.Flags.bTXFIN)
+		{
+			if((len != MyTCB.remoteWindow) && (len != MyTCB.wRemoteMSS))
+				vTCPFlags |= FIN;
+		}
 	}
 
 	// Ensure that all packets with data of some kind are 
@@ -2914,6 +3030,10 @@ static void SendTCP(BYTE vTCPFlags, BYTE vSendFlags)
 	// Pure ACK packets with no data are not ACKed back in TCP
 	if(len || (vTCPFlags & (SYN | FIN)))
 	{
+		// Transmitting data, update remote window variable to reflect smaller 
+		// window.
+		MyTCB.remoteWindow -= len;
+
 		// Push (PSH) all data for enhanced responsiveness on 
 		// the remote end, especially with GUIs
 		if(len)
@@ -2988,13 +3108,7 @@ static void SendTCP(BYTE vTCPFlags, BYTE vSendFlags)
 	}
 	if(vTCPFlags & FIN)
 	{
-		if(MyTCB.flags.bFINSent)
-			header.SeqNumber--;
-		else
-		{
-			MyTCB.MySEQ++;
-			MyTCB.flags.bFINSent = 1;
-		}
+        MyTCB.flags.bFINSent = 1;   // do not advance the seq no for FIN!
 	}
 
 	// Calculate the amount of free space in the RX buffer area of this socket
@@ -3004,9 +3118,15 @@ static void SendTCP(BYTE vTCPFlags, BYTE vSendFlags)
 		header.Window = MyTCBStub.rxTail - MyTCBStub.rxHead - 1;
 
 	// Calculate the amount of free space in the MAC RX buffer area and adjust window if needed
-	wVal.Val = MACGetFreeRxSize()-64;
-	if((SHORT)wVal.Val < (SHORT)0)
+	wVal.Val = MACGetFreeRxSize();
+	if(wVal.Val < 64)
+    {
 		wVal.Val = 0;
+    }
+    else
+    {
+		wVal.Val -= 64;
+    }
 	// Force the remote node to throttle back if we are running low on general RX buffer space
 	if(header.Window > wVal.Val)
 		header.Window = wVal.Val;
@@ -3025,7 +3145,7 @@ static void SendTCP(BYTE vTCPFlags, BYTE vSendFlags)
 		options.Length = 0x04;
 
 		// Load MSS and swap to big endian
-		options.MaxSegSize.Val = (((TCP_MAX_SEG_SIZE-4)&0x00FF)<<8) | (((TCP_MAX_SEG_SIZE-4)&0xFF00)>>8);
+		options.MaxSegSize.Val = (((TCP_MAX_SEG_SIZE_RX)&0x00FF)<<8) | (((TCP_MAX_SEG_SIZE_RX)&0xFF00)>>8);
 
 		header.DataOffset.Val   += sizeof(options) >> 2;
 	}
@@ -3051,7 +3171,7 @@ static void SendTCP(BYTE vTCPFlags, BYTE vSendFlags)
 	wVal.Val = CalcIPBufferChecksum(len);
 #if defined(DEBUG_GENERATE_TX_LOSS)
 	// Damage TCP checksums on TX packets randomly
-	if(rand() > DEBUG_GENERATE_TX_LOSS)
+	if(LFSRRand() > DEBUG_GENERATE_TX_LOSS)
 	{
 		wVal.Val++;
 	}
@@ -3350,13 +3470,108 @@ static void CloseSocket(void)
 	MyTCB.flags.bRXNoneACKed1 = 0;
 	MyTCB.flags.bRXNoneACKed2 = 0;
 	MyTCB.txUnackedTail = MyTCBStub.bufferTxStart;
-	((DWORD_VAL*)(&MyTCB.MySEQ))->w[0] = rand();
-	((DWORD_VAL*)(&MyTCB.MySEQ))->w[1] = rand();
+	((DWORD_VAL*)(&MyTCB.MySEQ))->w[0] = LFSRRand();
+	((DWORD_VAL*)(&MyTCB.MySEQ))->w[1] = LFSRRand();
 	MyTCB.sHoleSize = -1;
 	MyTCB.remoteWindow = 1;
 }
 
 
+/*****************************************************************************
+  Function:
+	static WORD GetMaxSegSizeOption(void)
+
+  Summary:
+	Obtains the Maximum Segment Size (MSS) TCP Option out of the TCP header 
+	for the current socket.
+
+  Description:
+	Parses the current TCP packet header and extracts the Maximum Segment Size 
+	option.  
+
+  Precondition:
+	Must be called while a TCP packet is present and being processed via 
+	HandleTCPSeg() and only if the the TCP SYN flag is set.
+
+  Parameters:
+	None
+
+  Returns:
+	Maximum segment size option value.  If illegal or not present, a failsafe 
+	value of 536 is returned.  If the option is larger than the 
+	TCP_MAX_SEG_SIZE_TX upper limit, then TCP_MAX_SEG_SIZE_TX is returned.
+
+  Remarks:
+	The internal MAC Read Pointer is moved but not restored.
+  ***************************************************************************/
+static WORD GetMaxSegSizeOption(void)
+{
+	BYTE vOptionsBytes;
+	BYTE vOption;
+	WORD wMSS;
+
+	// Find out how many options bytes are in this packet.
+	IPSetRxBuffer(2+2+4+4);	// Seek to data offset field, skipping Source port (2), Destination port (2), Sequence number (4), and Acknowledgement number (4)
+	vOptionsBytes = MACGet();
+	vOptionsBytes = ((vOptionsBytes&0xF0)>>2) - sizeof(TCP_HEADER);
+
+	// Return minimum Maximum Segment Size value of 536 bytes if none are 
+	// present
+	if(vOptionsBytes == 0u)
+		return 536;
+		
+	// Seek to beginning of options
+	MACGetArray(NULL, 7);
+
+	// Search for the Maximum Segment Size option	
+	while(vOptionsBytes--)
+	{
+		vOption = MACGet();
+		
+		if(vOption == 0u)	// End of Options list
+			break;
+		
+		if(vOption == 1u)	// NOP option
+			continue;
+			
+		if(vOption == 2u)	// Maximum Segment Size option
+		{
+			if(vOptionsBytes < 3u)
+				break;
+
+			wMSS = 0;
+				
+			// Get option length
+			vOption = MACGet();
+			if(vOption == 4u)
+			{// Retrieve MSS and swap value to little endian
+				((BYTE*)&wMSS)[1] = MACGet();
+				((BYTE*)&wMSS)[0] = MACGet();
+			}
+			
+			if(wMSS < 536u)
+				break;
+			if(wMSS > TCP_MAX_SEG_SIZE_TX)
+				return TCP_MAX_SEG_SIZE_TX;
+			else 
+				return wMSS;
+		}
+		else
+		{ // Assume this is a multi byte option and throw it way
+			if(vOptionsBytes < 2u)
+				break;
+			vOption = MACGet();
+			if(vOptionsBytes < vOption)
+				break;
+			MACGetArray(NULL, vOption);
+			vOptionsBytes -= vOption;
+		}
+		
+	}
+	
+	// Did not find MSS option, return worst case default
+	return 536;
+}
 
 /*****************************************************************************
   Function:
@@ -3394,6 +3609,8 @@ static void HandleTCPSeg(TCP_HEADER* h, WORD len)
 	DWORD localSeqNumber;
 	WORD wSegmentLength;
 	BOOL bSegmentAcceptable;
+	WORD wNewWindow;
+
 
 	// Cache a few variables in local RAM.  
 	// PIC18s take a fair amount of code and execution time to 
@@ -3438,6 +3655,9 @@ static void HandleTCPSeg(TCP_HEADER* h, WORD len)
 			{
 				// We now have a sequence number for the remote node
 				MyTCB.RemoteSEQ = localSeqNumber + 1;
+
+				// Get MSS option
+				MyTCB.wRemoteMSS = GetMaxSegSizeOption();
 
 				// Set Initial Send Sequence (ISS) number
 				// Nothing to do on this step... ISS already set in CloseSocket()
@@ -3489,10 +3709,17 @@ static void HandleTCPSeg(TCP_HEADER* h, WORD len)
 				MyTCB.RemoteSEQ = localSeqNumber + 1;
 				MyTCB.remoteWindow = h->Window;
 
+				// Get MSS option
+				MyTCB.wRemoteMSS = GetMaxSegSizeOption();
+
 				if(localHeaderFlags & ACK)
 				{
 					SendTCP(ACK, SENDTCP_RESET_TIMERS);
 					MyTCBStub.smState = TCP_ESTABLISHED;
+					// Set up keep-alive timer
+					#if defined(TCP_KEEP_ALIVE_TIMEOUT)
+						MyTCBStub.eventTime = TickGet() + TCP_KEEP_ALIVE_TIMEOUT;
+					#endif
 					MyTCBStub.Flags.bTimerEnabled = 0;
 				}
 				else
@@ -3628,11 +3855,19 @@ static void HandleTCPSeg(TCP_HEADER* h, WORD len)
 			dwTemp = MyTCB.MySEQ + (DWORD)wTemp;
 
 			// Drop the packet if it ACKs something we haven't sent
-			if((LONG)(dwTemp - localAckNumber) < (LONG)0)
-			{
-				SendTCP(ACK, 0);
-				return;
-			}
+            dwTemp = (LONG)localAckNumber - (LONG)dwTemp;
+            if((LONG)dwTemp > 0)
+            {   // acknowledged more than we've sent??
+                if(!MyTCB.flags.bFINSent || dwTemp != 1)
+                {
+                    SendTCP(ACK, 0);
+                    return;
+                }
+                else
+                {
+                    localAckNumber--;   // since we don't count the FIN anyway
+                }
+            }
 
 			// Throw away all ACKnowledged TX data:
 			// Calculate what the last acknowledged sequence number was (ignoring any FINs we sent)
@@ -3702,32 +3937,40 @@ static void HandleTCPSeg(TCP_HEADER* h, WORD len)
 				// Make sure there isn't a "FIN byte in our TX FIFO"
 				if(MyTCBStub.Flags.bTXFIN == 0u)
 				{
+					// Convert retransmission timer to keep-alive timer
+					#if defined(TCP_KEEP_ALIVE_TIMEOUT)
+						MyTCBStub.eventTime = TickGet() + TCP_KEEP_ALIVE_TIMEOUT;
+					#endif
 					MyTCBStub.Flags.bTimerEnabled = 0;
 				}
 				else
 				{
 					// "Throw away" FIN byte from our TX FIFO if it has been ACKed
-					if(MyTCB.MySEQ == localAckNumber)
+					if((MyTCB.MySEQ == localAckNumber) && MyTCB.flags.bFINSent)
 					{
 						MyTCBStub.Flags.bTimerEnabled = 0;
 						MyTCBStub.Flags.bTXFIN = 0;
-						MyTCB.flags.bFINSent = 0;	
 					}
 				}
 			}
 
-			// Update the local stored copy of the RemoteWindow
-			// If previously we had a zero window, and now we don't 
-			// immediately send whatever was pending
-			if((MyTCB.remoteWindow == 0u) && h->Window)
+			// The window size advirtised in this packet is adjusted to account 
+			// for any bytes that we have transmitted but haven't been ACKed yet 
+			// by this segment.
+			wNewWindow = h->Window - ((WORD)(MyTCB.MySEQ - localAckNumber));
+
+			// Update the local stored copy of the RemoteWindow.
+			// If previously we had a zero window, and now we don't, then 
+			// immediately send whatever was pending.
+			if((MyTCB.remoteWindow == 0u) && wNewWindow)
 				MyTCBStub.Flags.bTXASAP = 1;
-			MyTCB.remoteWindow = h->Window;
+			MyTCB.remoteWindow = wNewWindow;
 
 			// A couple of states must do all of the TCP_ESTABLISHED stuff, but also a little more
 			if(MyTCBStub.smState == TCP_FIN_WAIT_1)
 			{
 				// Check to see if our FIN has been ACKnowledged
-				if(MyTCB.MySEQ == localAckNumber)
+				if((MyTCB.MySEQ == localAckNumber) && MyTCB.flags.bFINSent)
 				{
 					// Reset our timer for forced closure if the remote node 
 					// doesn't send us a FIN in a timely manner.
@@ -3778,7 +4021,7 @@ static void HandleTCPSeg(TCP_HEADER* h, WORD len)
 
 		case TCP_LAST_ACK:
 			// Check to see if our FIN has been ACKnowledged
-			if(MyTCB.MySEQ == localAckNumber)
+			if(MyTCB.MySEQ + 1 == localAckNumber)
 				CloseSocket();
 			return;
 
@@ -4108,6 +4351,11 @@ BOOL TCPAdjustFIFOSize(TCP_SOCKET hTCP, WORD wMinRXSize, WORD wMinTXSize, BYTE v
 	PTR_BASE ptrTemp, ptrHead;
 	WORD wTXAllocation;
 	
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return FALSE;
+    }
+    
 	// Load up info on this socket
 	SyncTCBStub(hTCP);
 
@@ -4306,8 +4554,8 @@ static void TCPRAMCopy(PTR_BASE ptrDest, BYTE vDestType, PTR_BASE ptrSource, BYT
 					break;
 	
 				case TCP_ETH_RAM:
-					if(!((WORD_VAL*)&ptrDest)->bits.b15)
-						MACSetWritePtr((WORD)ptrDest);
+					if(ptrDest!=(PTR_BASE)-1)
+						MACSetWritePtr(ptrDest);
 					MACPutArray((BYTE*)ptrSource, wLength);
 					break;
 	
@@ -4323,7 +4571,7 @@ static void TCPRAMCopy(PTR_BASE ptrDest, BYTE vDestType, PTR_BASE ptrSource, BYT
 			switch(vDestType)
 			{
 				case TCP_PIC_RAM:
-					if(!((WORD_VAL*)&ptrSource)->bits.b15)
+					if(ptrSource!=(PTR_BASE)-1)
 						MACSetReadPtr(ptrSource);
 					MACGetArray((BYTE*)ptrDest, wLength);
 					break;
@@ -4335,7 +4583,7 @@ static void TCPRAMCopy(PTR_BASE ptrDest, BYTE vDestType, PTR_BASE ptrSource, BYT
 	
 				#if defined(SPIRAM_CS_TRIS)
 				case TCP_SPI_RAM:
-					if(!((WORD_VAL*)&ptrSource)->bits.b15)
+					if(ptrSource!=(PTR_BASE)-1)
 						MACSetReadPtr(ptrSource);
 					w = sizeof(vBuffer);
 					while(wLength)
@@ -4363,7 +4611,7 @@ static void TCPRAMCopy(PTR_BASE ptrDest, BYTE vDestType, PTR_BASE ptrSource, BYT
 					break;
 	
 				case TCP_ETH_RAM:
-					if(!((WORD_VAL*)&ptrDest)->bits.b15)
+					if(ptrDest!=(PTR_BASE)-1)
 						MACSetWritePtr(ptrDest);
 					w = sizeof(vBuffer);
 					while(wLength)
@@ -4445,7 +4693,7 @@ static void TCPRAMCopyROM(PTR_BASE wDest, BYTE wDestType, ROM BYTE* wSource, WOR
 			break;
 	
 		case TCP_ETH_RAM:
-			if(!((WORD_VAL*)&wDest)->bits.b15)
+			if(wDest!=(PTR_BASE)-1)
 				MACSetWritePtr(wDest);
 			w = sizeof(vBuffer);
 			while(wLength)
@@ -4517,6 +4765,11 @@ BOOL TCPStartSSLClient(TCP_SOCKET hTCP, BYTE* host)
 {
 	BYTE i;
 	
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return FALSE;
+    }
+    
 	SyncTCBStub(hTCP);
 	
 	// Make sure SSL is not established already
@@ -4524,7 +4777,71 @@ BOOL TCPStartSSLClient(TCP_SOCKET hTCP, BYTE* host)
 		return FALSE;
 	
 	// Try to start the session
-	MyTCBStub.sslStubID = SSLStartSession(hTCP);
+	MyTCBStub.sslStubID = SSLStartSession(hTCP, NULL, 0);
+	
+	// Make sure a session stub was obtained
+	if(MyTCBStub.sslStubID == SSL_INVALID_ID)
+		return FALSE;
+
+	// Mark connection as handshaking and return
+	MyTCBStub.sslReqMessage = SSL_CLIENT_HELLO;
+	MyTCBStub.sslRxHead = MyTCBStub.rxHead;
+	MyTCBStub.sslTxHead = MyTCBStub.txHead;
+	MyTCBStub.Flags.bSSLHandshaking = 1;
+	for(i = 0; i < 5u; i++)
+	{// Skip first 5 bytes in TX for the record header
+		if(++MyTCBStub.sslTxHead >= MyTCBStub.bufferRxStart)
+			MyTCBStub.sslTxHead = MyTCBStub.bufferTxStart;
+	}
+	return TRUE;
+}
+#endif // SSL Client
+
+/*****************************************************************************
+  Function:
+	BOOL TCPStartSSLClientEx(TCP_SOCKET hTCP, BYTE* host, BYTE * buffer, BYTE suppDataType)
+
+  Summary:
+	Begins an SSL client session.
+
+  Description:
+	This function escalates the current connection to an SSL secured 
+	connection by initiating an SSL client handshake.
+
+  Precondition:
+	TCP is initialized and hTCP is already connected.
+
+  Parameters:
+	hTCP			- TCP connection to secure
+	host			- Expected host name on certificate (currently ignored)
+	buffer      	- Buffer for supplementary data return
+	suppDataType 	- Type of supplementary data to copy
+
+  Return Values:
+	TRUE 		- an SSL connection was initiated
+	FALSE 		- Insufficient SSL resources (stubs) were available
+
+  Remarks:
+	The host parameter is currently ignored and is not validated.
+  ***************************************************************************/
+#if defined(STACK_USE_SSL_CLIENT)
+BOOL TCPStartSSLClientEx(TCP_SOCKET hTCP, BYTE* host, void * buffer, BYTE suppDataType)
+{
+	BYTE i;
+	
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return FALSE;
+    }
+    
+	SyncTCBStub(hTCP);
+	
+	// Make sure SSL is not established already
+	if(MyTCBStub.sslStubID != SSL_INVALID_ID)
+		return FALSE;
+	
+	// Try to start the session
+	MyTCBStub.sslStubID = SSLStartSession(hTCP, buffer, suppDataType);
 	
 	// Make sure a session stub was obtained
 	if(MyTCBStub.sslStubID == SSL_INVALID_ID)
@@ -4570,6 +4887,11 @@ BOOL TCPStartSSLServer(TCP_SOCKET hTCP)
 {
 	BYTE i;
 	
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return FALSE;
+    }
+    
 	SyncTCBStub(hTCP);
 	SyncTCB();
 	
@@ -4578,7 +4900,7 @@ BOOL TCPStartSSLServer(TCP_SOCKET hTCP)
 		return TRUE;
 	
 	// Try to start the session
-	MyTCBStub.sslStubID = SSLStartSession(hTCP);
+	MyTCBStub.sslStubID = SSLStartSession(hTCP, NULL, 0);
 	
 	// Make sure a session stub was obtained
 	if(MyTCBStub.sslStubID == SSL_INVALID_ID)
@@ -4628,6 +4950,11 @@ BOOL TCPStartSSLServer(TCP_SOCKET hTCP)
 #if defined(STACK_USE_SSL_SERVER)
 BOOL TCPAddSSLListener(TCP_SOCKET hTCP, WORD port)
 {
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return FALSE;
+    }
+    
 	SyncTCBStub(hTCP);
 	
 	if(MyTCBStub.smState != TCP_LISTEN)
@@ -4667,6 +4994,11 @@ BOOL TCPAddSSLListener(TCP_SOCKET hTCP, WORD port)
 #if defined(STACK_USE_SSL)
 BOOL TCPRequestSSLMessage(TCP_SOCKET hTCP, BYTE msg)
 {
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return FALSE;
+    }
+    
 	SyncTCBStub(hTCP);
 	
 	if(msg == SSL_NO_MESSAGE || MyTCBStub.sslReqMessage == SSL_NO_MESSAGE)
@@ -4704,6 +5036,11 @@ BOOL TCPRequestSSLMessage(TCP_SOCKET hTCP, BYTE msg)
 #if defined(STACK_USE_SSL)
 BOOL TCPSSLIsHandshaking(TCP_SOCKET hTCP)
 {
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return FALSE;
+    }
+    
 	SyncTCBStub(hTCP);
 	return MyTCBStub.Flags.bSSLHandshaking;	
 }
@@ -4733,6 +5070,11 @@ BOOL TCPSSLIsHandshaking(TCP_SOCKET hTCP)
 #if defined(STACK_USE_SSL)
 BOOL TCPIsSSL(TCP_SOCKET hTCP)
 {
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return FALSE;
+    }
+    
 	SyncTCBStub(hTCP);
 	
 	if(MyTCBStub.sslStubID == SSL_INVALID_ID)
@@ -4769,6 +5111,11 @@ BOOL TCPIsSSL(TCP_SOCKET hTCP)
 #if defined(STACK_USE_SSL)
 void TCPSSLHandshakeComplete(TCP_SOCKET hTCP)
 {
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return;
+    }
+    
 	SyncTCBStub(hTCP);
 	MyTCBStub.Flags.bSSLHandshaking = 0;
 }
@@ -4809,6 +5156,11 @@ void TCPSSLDecryptMAC(TCP_SOCKET hTCP, ARCFOUR_CTX* ctx, WORD len)
 	PTR_BASE wSrc, wDest, wBlockLen, wTemp;
 	BYTE buffer[32];
 	
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return;
+    }
+    
 	// Set up the pointers
 	SyncTCBStub(hTCP);
 	wSrc = MyTCBStub.rxTail;
@@ -4896,6 +5248,11 @@ void TCPSSLInPlaceMACEncrypt(TCP_SOCKET hTCP, ARCFOUR_CTX* ctx, BYTE* MACSecret,
 	WORD blockLen;
 	BYTE buffer[32];
 	
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return;
+    }
+    
 	// Set up the pointers
 	SyncTCBStub(hTCP);
 	pos = MyTCBStub.txHead;
@@ -4998,6 +5355,11 @@ void TCPSSLPutRecordHeader(TCP_SOCKET hTCP, BYTE* hdr, BOOL recDone)
 {
 	BYTE i;
 	
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return;
+    }
+    
 	// Set up the pointers
 	SyncTCBStub(hTCP);
 	
@@ -5056,6 +5418,11 @@ void TCPSSLPutRecordHeader(TCP_SOCKET hTCP, BYTE* hdr, BOOL recDone)
 #if defined(STACK_USE_SSL)
 WORD TCPSSLGetPendingTxSize(TCP_SOCKET hTCP)
 {
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return 0;
+    }
+    
 	SyncTCBStub(hTCP);
 
 	// Non-SSL connections have no pending SSL data
@@ -5101,6 +5468,11 @@ void TCPSSLHandleIncoming(TCP_SOCKET hTCP)
 	PTR_BASE prevRxTail, nextRxHead, startRxTail, wSrc, wDest;
 	WORD wToMove, wLen, wSSLBytesThatPoofed, wDecryptedBytes;
 	
+	if(hTCP >= TCP_SOCKET_COUNT)
+    {
+        return;
+    }
+    
 	// Sync the stub
 	SyncTCBStub(hTCP);
 

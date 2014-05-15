@@ -50,18 +50,13 @@
  * various third parties.  It is your responsibility to obtain 
  * information regarding any applicable licensing obligations.
  *
- *
- * Author               Date		Comment
- *~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- * Elliott Wood	        6/20/07		Original
- * Elliott Wood	        10/15/07	Modified API to support both ops
  ********************************************************************/
 #define __RSA_C
 
 #include "TCPIPConfig.h"
 #include "HardwareProfile.h"
 
-#if (defined(STACK_USE_SSL_SERVER) || defined(STACK_USE_SSL_CLIENT)) && !defined(ENC100_INTERFACE_MODE)
+#if (defined(STACK_USE_SSL_SERVER) || defined(STACK_USE_SSL_CLIENT)) && (!defined(ENC100_INTERFACE_MODE) || (SSL_RSA_CLIENT_SIZE > 1024))
 
 // To comply with US Export Control restrictions, the encryption 
 // portion of the SSL module must be obtained separately from 

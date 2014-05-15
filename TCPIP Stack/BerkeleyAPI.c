@@ -60,11 +60,13 @@ static BOOL HandlePossibleTCPDisconnection(SOCKET s);
 #if defined(__18CXX) && !defined(HI_TECH_C)	
 	#pragma udata BSD_uRAM
 #endif
+// Array of BSDSocket elements; used to track all socket state and connection information.
 static struct BSDSocket  BSDSocketArray[BSD_SOCKET_COUNT];
 #if defined(__18CXX) && !defined(HI_TECH_C)	
 	#pragma udata
 #endif
 
+// Contains the next local port number to associate with a socket.
 static WORD gAutoPortNumber = 1024;
 
 
@@ -100,6 +102,7 @@ void BerkeleySocketInit(void)
 	{
 		socket             = (struct BSDSocket *)&BSDSocketArray[s];
 		socket->bsdState   = SKT_CLOSED;
+		socket->SocketID = INVALID_UDP_SOCKET;
 	}
 }
 
@@ -136,6 +139,23 @@ SOCKET socket( int af, int type, int protocol )
 
 	if( af != AF_INET )
 		return INVALID_SOCKET;
+
+	if(protocol == IPPROTO_IP)		
+	{
+		switch(type)
+		{
+			case SOCK_DGRAM:
+				protocol = IPPROTO_UDP;
+			break;
+
+			case SOCK_STREAM:
+				protocol = IPPROTO_TCP;
+			break;
+			
+			default:
+			break;
+		}
+	}
 
 	for( s = 0; s < BSD_SOCKET_COUNT; s++,socket++ )
 	{
@@ -220,7 +240,7 @@ int bind( SOCKET s, const struct sockaddr* name, int namelen )
 
 	if(socket->SocketType == SOCK_DGRAM)
 	{
-		socket->SocketID = UDPOpen(lPort, NULL, 0);
+		socket->SocketID = UDPOpenEx(0,UDP_OPEN_SERVER,lPort, 0);
 		if(socket->SocketID == INVALID_UDP_SOCKET)
 			return SOCKET_ERROR;
 	}
@@ -510,7 +530,7 @@ int connect( SOCKET s, struct sockaddr* name, int namelen )
 	        if(gAutoPortNumber > 5000u) // reset the port numbers
 				gAutoPortNumber = 1024;
 
-			socket->SocketID = UDPOpen(localPort, NULL, remotePort);
+			socket->SocketID = UDPOpenEx(0,UDP_OPEN_SERVER,localPort, remotePort);
 			if(socket->SocketID == INVALID_UDP_SOCKET)
 				return SOCKET_ERROR;
 			socket->bsdState = SKT_BOUND;
@@ -638,11 +658,11 @@ int sendto( SOCKET s, const char* buf, int len, int flags, const struct sockaddr
 			remoteInfo.IPAddr.Val = 0xFFFFFFFFu;
 
 		// Set the remote IP and MAC address if it is different from what we already have stored in the UDP socket
-		if(UDPSocketInfo[socket->SocketID].remoteNode.IPAddr.Val != remoteInfo.IPAddr.Val)
+		if(UDPSocketInfo[socket->SocketID].remote.remoteNode.IPAddr.Val != remoteInfo.IPAddr.Val)
 		{
 			if(ARPIsResolved(&remoteInfo.IPAddr, &remoteInfo.MACAddr))
 			{
-				memcpy((void*)&UDPSocketInfo[socket->SocketID].remoteNode, (void*)&remoteInfo, sizeof(remoteInfo));
+				memcpy((void*)&UDPSocketInfo[socket->SocketID].remote.remoteNode, (void*)&remoteInfo, sizeof(remoteInfo));
 			}
 			else
 			{
@@ -820,9 +840,8 @@ int recvfrom( SOCKET s, char* buf, int len, int flags, struct sockaddr* from, in
 			{
 				if((unsigned int)*fromlen >= sizeof(struct sockaddr_in))
 				{
-					remoteSockInfo = TCPGetRemoteInfo(socket->SocketID);
-					rem_addr->sin_addr.S_un.S_addr = remoteSockInfo->remote.IPAddr.Val;
-					rem_addr->sin_port = remoteSockInfo->remotePort.Val;
+					rem_addr->sin_addr.S_un.S_addr = UDPSocketInfo[socket->SocketID].remote.remoteNode.IPAddr.Val;
+					rem_addr->sin_port = UDPSocketInfo[socket->SocketID].remotePort;
 					*fromlen = sizeof(struct sockaddr_in);
 				}
 			}
@@ -927,6 +946,7 @@ int gethostname(char* name, int namelen)
   ***************************************************************************/
 int closesocket( SOCKET s )
 {	
+	BYTE i;
 	struct BSDSocket *socket;
 
 	if( s >= BSD_SOCKET_COUNT )
@@ -937,19 +957,59 @@ int closesocket( SOCKET s )
 	if(socket->bsdState == SKT_CLOSED)
 		return 0;	// Nothing to do, so return success
 
-	if( socket->SocketType == SOCK_STREAM)
+	if(socket->SocketType == SOCK_STREAM)
 	{
-		if(socket->bsdState >= SKT_LISTEN)
+		if(socket->bsdState == SKT_BSD_LISTEN)
 		{
-			HandlePossibleTCPDisconnection(s);
-			
-			if(socket->bsdState == SKT_LISTEN)
-				return 0;
+			// This is a listerner handle, so when we close it we also should 
+			// close all TCP sockets that were opened for backlog processing 
+			// but didn't actually get connected
+			for(i = 0; i < sizeof(BSDSocketArray)/sizeof(BSDSocketArray[0]); i++)
+			{
+				if(BSDSocketArray[i].bsdState != SKT_LISTEN)
+					continue;
+				if(BSDSocketArray[i].localPort == socket->localPort)
+				{
+					TCPClose(BSDSocketArray[i].SocketID);
+					BSDSocketArray[i].bsdState = SKT_CLOSED;
+				}
+			}
+		}
+		else if(socket->bsdState >= SKT_LISTEN)
+		{
+			// For server sockets, if the parent listening socket is still open, 
+			// then return this socket to the queue for future backlog processing.
+			if(socket->isServer)
+			{
+				for(i = 0; i < sizeof(BSDSocketArray)/sizeof(BSDSocketArray[0]); i++)
+				{
+					if(BSDSocketArray[i].bsdState != SKT_BSD_LISTEN)
+						continue;
+					if(BSDSocketArray[i].localPort == socket->localPort)
+					{
+						TCPDisconnect(socket->SocketID);
+						
+						// Listener socket is still open, so just return to the 
+						// listening state so that the user must call accept() again to 
+						// reuse this BSD socket
+						socket->bsdState = SKT_LISTEN;
+						return 0;
+					}
+				}
+				// If we get down here, then the parent listener socket has 
+				// apparently already been closed, so this socket can not be 
+				// reused.  Close it complete.
+				TCPClose(socket->SocketID);
+			}
+			else if(socket->bsdState != SKT_DISCONNECTED)	// this is a client socket that isn't already disconnected
+			{
+				TCPClose(socket->SocketID);
+			}
 		}
 	}
 	else //udp sockets
 	{
-		if(socket->SocketID != INVALID_UDP_SOCKET)
+		if(socket->bsdState == SKT_BOUND)
 			UDPClose(socket->SocketID);
 	}
 
@@ -976,7 +1036,7 @@ int closesocket( SOCKET s )
   Parameters:
 	s - TCP type socket descriptor returned from a previous call to socket.  
 	    This socket must be in the SKT_LISTEN, SKT_IN_PROGRESS, SKT_EST, or 
-	    SKT_DISCONNECT states.
+	    SKT_DISCONNECTED states.
 
   Returns:
 	TRUE - Socket is disconnected

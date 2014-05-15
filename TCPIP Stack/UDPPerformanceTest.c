@@ -52,7 +52,6 @@
  * Howard Schlunder     01/29/07	Original
  ********************************************************************/
 #define __UDPPERFORMANCETEST_C
-#define STACK_USE_UDP_PERFORMANCE_TEST
 
 #include "TCPIPConfig.h"
 
@@ -102,14 +101,14 @@ void UDPPerformanceTask(void)
 	WORD		wTemp;
 	static DWORD dwCounter = 1;
 
-	if((0) && (dwCounter > 1024u))//if((BUTTON3_IO) && (dwCounter > 1024u))
+	if((BUTTON3_IO) && (dwCounter > 1024u))
 		return;
 
 	// Suppress transmissions if we don't have an Ethernet link so our counter starts correctly at 0x00000001
 	if(!MACIsLinked())
 		return;
 	
-	#if defined(STACK_USE_DHCP_CLIENT) && defined(DELAY_UDP_PERFORMANCE_TEST)
+	#if defined(STACK_USE_DHCP_CLIENT) && defined(UDP_PERFORMANCE)
 	{
 		static DWORD dwTimer = 0;
 		
@@ -132,7 +131,8 @@ void UDPPerformanceTask(void)
 	memset(&Remote, 0xFF, sizeof(Remote));
 	
 	// Open a UDP socket for outbound transmission
-	MySocket = UDPOpen(0, &Remote, PERFORMANCE_PORT);
+	MySocket = UDPOpenEx((DWORD)(PTR_BASE)&Remote,UDP_OPEN_NODE_INFO,0,PERFORMANCE_PORT);
+	//MySocket = UDPOpen(0, &Remote, PERFORMANCE_PORT);
 	
 	// Abort operation if no UDP sockets are available
 	// If this ever happens, incrementing MAX_UDP_SOCKETS in 

@@ -98,18 +98,12 @@
 #define BFC (0x5<<5)            // Bit Field Clear command
 #define RCR (0x0<<5)            // Read Control Register command
 #define RBM ((0x1<<5) | 0x1A)   // Read Buffer Memory command
-#define WBM ((0x3<<5) | 0x1A) // Write Buffer Memory command
+#define WBM ((0x3<<5) | 0x1A)   // Write Buffer Memory command
 #define SR  ((0x7<<5) | 0x1F)   // System Reset command does not use an address.
                                 //   It requires 0x1F, however.
 
-// PIC32MX460F512L USB PIM on Explorer 16 SPI port 1 can't operate with a
-// maximum 20MHz SPI clock.  74HCT4053 analog mux chips damage the SPI SDI
-// signal too much.
-#if defined(__PIC32MX__) && defined(EXPLORER_16) && defined(_USB) && (ENC_SSPBUF == SPI1BUF)
-    #define ENC_MAX_SPI_FREQ    (13333333ul)    // Hz
-#else
-    #define ENC_MAX_SPI_FREQ    (20000000ul)    // Hz
-#endif
+// Maximum SPI frequency specified in data sheet
+#define ENC_MAX_SPI_FREQ    (20000000ul)    // Hz
 
 #define ETHER_IP    (0x00u)
 #define ETHER_ARP   (0x06u)
@@ -135,7 +129,6 @@ typedef struct  __attribute__((aligned(2), packed))
     static inline __attribute__((__always_inline__)) void WaitForDataByte( void )
     {
         while ((ENC_SPISTATbits.SPITBF == 1) || (ENC_SPISTATbits.SPIRBF == 0));
-		 while ((ENC_SPISTATbits.SPITBF == 1) || (ENC_SPISTATbits.SPIRBF == 0));
     }
 
     #define SPI_ON_BIT          (ENC_SPISTATbits.SPIEN)
@@ -192,13 +185,6 @@ static BYTE ENCRevID;
 void MACInit(void)
 {
     BYTE i;
-	ENC_SPI_IF = 0;
-
-	ENC_RST_IO = 1;
-	DelayMs(2);
-	ENC_RST_IO = 0;
-	DelayMs(2);
-	ENC_RST_IO = 1;
 
     // Set up the SPI module on the PIC for communications with the ENC28J60
     ENC_CS_IO = 1;
@@ -225,11 +211,10 @@ void MACInit(void)
     ENC_SPISTATbits.SMP = 0;// Input sampled at middle of data output time
 #elif defined(__C30__)
     ENC_SPISTAT = 0;        // clear SPI
-    #if defined(__PIC24H__) || defined(__dsPIC33F__)
+    #if defined(__PIC24H__) || defined(__dsPIC33F__) || defined(__dsPIC33E__)|| defined(__PIC24E__)
         ENC_SPICON1 = 0x0F;     // 1:1 primary prescale, 5:1 secondary prescale (8MHz  @ 40MIPS)
     //    ENC_SPICON1 = 0x1E;   // 4:1 primary prescale, 1:1 secondary prescale (10MHz @ 40MIPS, Doesn't work.  CLKRDY is incorrectly reported as being clear.  Problem caused by dsPIC33/PIC24H ES silicon bug.)
-    #elif defined(__PIC24F__)
-    //    ENC_SPICON1 = 0x1F;   // 1:1 prescale broken on PIC24F ES silicon     (16MHz @ 16MIPS)
+    #elif defined(__PIC24F__) || defined(__PIC24FK__)
         ENC_SPICON1 = 0x1B;     // 1:1 primary prescale, 2:1 secondary prescale (8MHz  @ 16MIPS)
     #else   // dsPIC30F
         ENC_SPICON1 = 0x17;     // 1:1 primary prescale, 3:1 secondary prescale (10MHz @ 30MIPS)
@@ -240,6 +225,7 @@ void MACInit(void)
     ENC_SPISTATbits.SPIEN = 1;
 #elif defined(__C32__)
     ENC_SPIBRG = (GetPeripheralClock()-1ul)/2ul/ENC_MAX_SPI_FREQ;
+    ENC_SPICON1bits.SMP = 1;	// Delay SDI input sampling (PIC perspective) by 1/2 SPI clock
     ENC_SPICON1bits.CKE = 1;
     ENC_SPICON1bits.MSTEN = 1;
     ENC_SPICON1bits.ON = 1;
@@ -251,7 +237,6 @@ void MACInit(void)
     // means the part is in RESET or there is something wrong with the SPI
     // connection.  This loop makes sure that we can communicate with the
     // ENC28J60 before proceeding.
-SendSystemReset();
     do
     {
         SendSystemReset();
@@ -827,7 +812,7 @@ void MACSetReadPtrInRx(WORD offset)
 
 
 /******************************************************************************
- * Function:        WORD MACSetWritePtr(WORD Address)
+ * Function:        PTR_BASE MACSetWritePtr(PTR_BASE Address)
  *
  * PreCondition:    None
  *
@@ -842,7 +827,7 @@ void MACSetReadPtrInRx(WORD offset)
  *
  * Note:            None
  *****************************************************************************/
-WORD MACSetWritePtr(WORD address)
+PTR_BASE MACSetWritePtr(PTR_BASE address)
 {
     WORD_VAL oldVal;
 
@@ -857,7 +842,7 @@ WORD MACSetWritePtr(WORD address)
 }
 
 /******************************************************************************
- * Function:        WORD MACSetReadPtr(WORD Address)
+ * Function:        PTR_BASE MACSetReadPtr(PTR_BASE Address)
  *
  * PreCondition:    None
  *
@@ -872,7 +857,7 @@ WORD MACSetWritePtr(WORD address)
  *
  * Note:            None
  *****************************************************************************/
-WORD MACSetReadPtr(WORD address)
+PTR_BASE MACSetReadPtr(PTR_BASE address)
 {
     WORD_VAL oldVal;
 
@@ -1012,15 +997,15 @@ WORD CalcIPBufferChecksum(WORD len)
 
 
 /******************************************************************************
- * Function:        void MACMemCopyAsync(WORD destAddr, WORD sourceAddr, WORD len)
+ * Function:        void MACMemCopyAsync(PTR_BASE destAddr, PTR_BASE sourceAddr, WORD len)
  *
  * PreCondition:    SPI bus must be initialized (done in MACInit()).
  *
  * Input:           destAddr:   Destination address in the Ethernet memory to
- *                              copy to.  If the MSb is set, the current EWRPT
- *                              value will be used instead.
- *                  sourceAddr: Source address to read from.  If the MSb is
- *                              set, the current ERDPT value will be used
+ *                              copy to.  If (PTR_BASE)-1 is specified, the 
+ *								current EWRPT value will be used instead.
+ *                  sourceAddr: Source address to read from.  If (PTR_BASE)-1 is
+ *                              specified, the current ERDPT value will be used
  *                              instead.
  *                  len:        Number of bytes to copy
  *
@@ -1035,27 +1020,27 @@ WORD CalcIPBufferChecksum(WORD len)
  *                  calling this function, this function will block until it
  *                  can start this transfer.
  *
- *                  If a negative value is used for the sourceAddr or destAddr
+ *                  If (PTR_BASE)-1 is used for the sourceAddr or destAddr
  *                  parameters, then that pointer will get updated with the
  *                  next address after the read or write.
  *****************************************************************************/
-void MACMemCopyAsync(WORD destAddr, WORD sourceAddr, WORD len)
+void MACMemCopyAsync(PTR_BASE destAddr, PTR_BASE sourceAddr, WORD len)
 {
     WORD_VAL ReadSave, WriteSave;
     BOOL UpdateWritePointer = FALSE;
     BOOL UpdateReadPointer = FALSE;
 
-    if(((WORD_VAL*)&destAddr)->bits.b15)
+    if(destAddr == (PTR_BASE)-1)
     {
         UpdateWritePointer = TRUE;
-        ((WORD_VAL*)&destAddr)->v[0] = ReadETHReg(EWRPTL).Val;
-        ((WORD_VAL*)&destAddr)->v[1] = ReadETHReg(EWRPTH).Val;
+        destAddr = ReadETHReg(EWRPTL).Val;
+        ((BYTE*)&destAddr)[1] = ReadETHReg(EWRPTH).Val;
     }
-    if(((WORD_VAL*)&sourceAddr)->bits.b15)
+    if(sourceAddr == (PTR_BASE)-1)
     {
         UpdateReadPointer = TRUE;
-        ((WORD_VAL*)&sourceAddr)->v[0] = ReadETHReg(ERDPTL).Val;
-        ((WORD_VAL*)&sourceAddr)->v[1] = ReadETHReg(ERDPTH).Val;
+        sourceAddr = ReadETHReg(ERDPTL).Val;
+        ((BYTE*)&sourceAddr)[1] = ReadETHReg(ERDPTH).Val;
     }
 
     // Handle special conditions where len == 0 or len == 1
@@ -1072,10 +1057,10 @@ void MACMemCopyAsync(WORD destAddr, WORD sourceAddr, WORD len)
             WriteSave.v[0] = ReadETHReg(EWRPTL).Val;
             WriteSave.v[1] = ReadETHReg(EWRPTH).Val;
         }
-        WriteReg(ERDPTL, ((WORD_VAL*)&sourceAddr)->v[0]);
-        WriteReg(ERDPTH, ((WORD_VAL*)&sourceAddr)->v[1]);
-        WriteReg(EWRPTL, ((WORD_VAL*)&destAddr)->v[0]);
-        WriteReg(EWRPTH, ((WORD_VAL*)&destAddr)->v[1]);
+        WriteReg(ERDPTL, ((BYTE*)&sourceAddr)[0]);
+        WriteReg(ERDPTH, ((BYTE*)&sourceAddr)[1]);
+        WriteReg(EWRPTL, ((BYTE*)&destAddr)[0]);
+        WriteReg(EWRPTH, ((BYTE*)&destAddr)[1]);
         while(len--)
             MACPut(MACGet());
         if(!UpdateReadPointer)
@@ -1099,14 +1084,14 @@ void MACMemCopyAsync(WORD destAddr, WORD sourceAddr, WORD len)
         }
         len += sourceAddr - 1;
         while(ReadETHReg(ECON1).ECON1bits.DMAST);
-        WriteReg(EDMASTL, ((WORD_VAL*)&sourceAddr)->v[0]);
-        WriteReg(EDMASTH, ((WORD_VAL*)&sourceAddr)->v[1]);
-        WriteReg(EDMADSTL, ((WORD_VAL*)&destAddr)->v[0]);
-        WriteReg(EDMADSTH, ((WORD_VAL*)&destAddr)->v[1]);
+        WriteReg(EDMASTL, ((BYTE*)&sourceAddr)[0]);
+        WriteReg(EDMASTH, ((BYTE*)&sourceAddr)[1]);
+        WriteReg(EDMADSTL, ((BYTE*)&destAddr)[0]);
+        WriteReg(EDMADSTH, ((BYTE*)&destAddr)[1]);
         if((sourceAddr <= RXSTOP) && (len > RXSTOP)) //&& (sourceAddr >= RXSTART))
             len -= RXSIZE;
-        WriteReg(EDMANDL, ((WORD_VAL*)&len)->v[0]);
-        WriteReg(EDMANDH, ((WORD_VAL*)&len)->v[1]);
+        WriteReg(EDMANDL, ((BYTE*)&len)[0]);
+        WriteReg(EDMANDH, ((BYTE*)&len)[1]);
         BFCReg(ECON1, ECON1_CSUMEN);
         BFSReg(ECON1, ECON1_DMAST);
         if(UpdateReadPointer)
@@ -1114,8 +1099,8 @@ void MACMemCopyAsync(WORD destAddr, WORD sourceAddr, WORD len)
             len++;
             if((sourceAddr <= RXSTOP) && (len > RXSTOP)) //&& (sourceAddr >= RXSTART))
                 len -= RXSIZE;
-            WriteReg(ERDPTL, ((WORD_VAL*)&len)->v[0]);
-            WriteReg(ERDPTH, ((WORD_VAL*)&len)->v[1]);
+            WriteReg(ERDPTL, ((BYTE*)&len)[0]);
+            WriteReg(ERDPTH, ((BYTE*)&len)[1]);
         }
     }
 }
@@ -1860,7 +1845,30 @@ static void WriteReg(BYTE Address, BYTE Data)
     #endif
 
     Dummy = ENC_SSPBUF;
-    ENC_CS_IO = 1;
+
+
+	// For faster processors (dsPIC), delay for a few clock cycles to ensure 
+	// the MAC/MII register write Chip Select hold time minimum of 210ns is met.
+//	#if GetInstructionClock() > 30000000
+//        {
+//		Nop();
+//		Nop();
+//        }
+//	#endif
+//	#if GetInstructionClock() > 40000000
+//        {
+//		Nop();
+//		Nop();
+//        }
+//	#endif
+//	#if GetInstructionClock() > 50000000
+//        {
+//		Nop();
+//		Nop();
+//        }
+//	#endif
+
+	ENC_CS_IO = 1;
 }//end WriteReg
 
 
@@ -2137,65 +2145,104 @@ BYTE GetCLKOUT(void)
 /******************************************************************************
  * Function:        void SetRXHashTableEntry(MAC_ADDR DestMACAddr)
  *
- * PreCondition:    SPI bus must be initialized (done in MACInit()).
+ * PreCondition:    SPI interface must be initialized (done in MACInit()).
  *
- * Input:           DestMACAddr: 6 byte group destination MAC address to allow
- *                               through the Hash Table Filter
+ * Input:           DestMACAddr: 6 byte group destination MAC address to allow 
+ *								 through the Hash Table Filter.  If DestMACAddr 
+ *								 is set to 00-00-00-00-00-00, then the hash 
+ *								 table will be cleared of all entries and the 
+ *								 filter will be disabled.
  *
- * Output:          Sets the appropriate bit in the EHT* registers to allow
- *                  packets sent to DestMACAddr to be received if the Hash
- *                  Table receive filter is enabled
+ * Output:          Sets the appropriate bit in the EHT* registers to allow 
+ *					packets sent to DestMACAddr to be received and enables the 
+ *					Hash Table receive filter (if not already).
  *
  * Side Effects:    None
  *
- * Overview:        Calculates a CRC-32 using polynomial 0x4C11DB7 and then,
- *                  using bits 28:23 of the CRC, sets the appropriate bit in
- *                  the EHT* registers
+ * Overview:        Calculates a CRC-32 using polynomial 0x4C11DB7 and then, 
+ *					using bits 28:23 of the CRC, sets the appropriate bit in 
+ *					the EHT0-EHT7 registers.
  *
- * Note:            This code is commented out to save code space on systems
- *                  that do not need this function.  Change the "#if 0" line
- *                  to "#if 1" to uncomment it.
+ * Note:            This code is commented out to save code space on systems 
+ *					that do not need this function.  Change the 
+ *					"#if STACK_USE_ZEROCONF_MDNS_SD" line to "#if 1" to 
+ *					uncomment it, assuming you aren't using the Zeroconf module, 
+ *					which requires mutlicast support and enables this function 
+ *					automatically.
+ *
+ *					There is no way to individually unset destination MAC 
+ *					addresses from the hash table since it is possible to have 
+ *					a hash collision and therefore multiple MAC addresses 
+ *					relying on the same hash table bit.  The stack would have 
+ *					to individually store each 6 byte MAC address to support 
+ *					this feature, which would waste a lot of RAM and be 
+ *					unnecessary in most applications.  As a simple compromise, 
+ *					you can call SetRXHashTableEntry() using a 
+ *					00-00-00-00-00-00 destination MAC address, which will clear 
+ *					the entire hash table and disable the hash table filter.  
+ *					This will allow you to then re-add the necessary 
+ *					destination address(es).
+ *
+ *					This function is intended to be used when 
+ *					ERXFCON.ANDOR == 0 (OR).
  *****************************************************************************/
-#if 0
+#if defined(STACK_USE_ZEROCONF_MDNS_SD)
 void SetRXHashTableEntry(MAC_ADDR DestMACAddr)
 {
     DWORD_VAL CRC = {0xFFFFFFFF};
     BYTE HTRegister;
     BYTE i, j;
 
-    // Calculate a CRC-32 over the 6 byte MAC address
-    // using polynomial 0x4C11DB7
-    for(i = 0; i < sizeof(MAC_ADDR); i++)
-    {
-        BYTE  crcnext;
+	// Select proper bank for ERXFCON and EHT0-EHT7 register access
+	BankSel(ERXFCON);
 
-        // shift in 8 bits
-        for(j = 0; j < 8; j++)
-        {
-            crcnext = 0;
-            if(((BYTE_VAL*)&(CRC.v[3]))->bits.b7)
-                crcnext = 1;
-            crcnext ^= (((BYTE_VAL*)&DestMACAddr.v[i])->bits.b0);
+	// Clear the Hash Table bits and disable the Hash Table Filter if a special 
+	// 00-00-00-00-00-00 destination MAC address is provided.
+	if((DestMACAddr.v[0] | DestMACAddr.v[1] | DestMACAddr.v[2] | DestMACAddr.v[3] | DestMACAddr.v[4] | DestMACAddr.v[5]) == 0x00u)
+	{
+		// Disable the Hash Table receive filter and clear the hash table
+		BFCReg((BYTE)ERXFCON, ERXFCON_HTEN);
+		for(i = (BYTE)EHT0; i <= (BYTE)EHT7; i++)
+			WriteReg(i, 0x00);
+	}
+	else
+	{
+		// Calculate a CRC-32 over the 6 byte MAC address
+		// using polynomial 0x4C11DB7
+		for(i = 0; i < sizeof(MAC_ADDR); i++)
+		{
+			BYTE  crcnext;
 
-            CRC.Val <<= 1;
-            if(crcnext)
-                CRC.Val ^= 0x4C11DB7;
-            // next bit
-            DestMACAddr.v[i] >>= 1;
-        }
-    }
+			// shift in 8 bits
+			for(j = 0; j < 8; j++)
+			{
+				crcnext = 0;
+				if(((BYTE_VAL*)&(CRC.v[3]))->bits.b7)
+					crcnext = 1;
+				crcnext ^= (((BYTE_VAL*)&DestMACAddr.v[i])->bits.b0);
 
-    // CRC-32 calculated, now extract bits 28:23
-    // Bits 25:23 define where within the Hash Table byte the bit needs to be set
-    // Bits 28:26 define which of the 8 Hash Table bytes that bits 25:23 apply to
-    i = CRC.v[3] & 0x1F;
-    HTRegister = (i >> 2) + (BYTE)EHT0;
-    i = (i << 1) & 0x06;
-    ((BYTE_VAL*)&i)->bits.b0 = ((BYTE_VAL*)&CRC.v[2])->bits.b7;
+				CRC.Val <<= 1;
+				if(crcnext)
+					CRC.Val ^= 0x4C11DB7;
+				// next bit
+				DestMACAddr.v[i] >>= 1;
+			}
+		}
 
-    // Set the proper bit in the Hash Table
-    BankSel(EHT0);
-    BFSReg(HTRegister, 1<<i);
+		// CRC-32 calculated, now extract bits 28:23
+		// Bits 25:23 define where within the Hash Table byte the bit needs to be set
+		// Bits 28:26 define which of the 8 Hash Table bytes that bits 25:23 apply to
+		i = CRC.v[3] & 0x1F;
+		HTRegister = (i >> 2) + (BYTE)EHT0;
+		i = (i << 1) & 0x06;
+		((BYTE_VAL*)&i)->bits.b0 = ((BYTE_VAL*)&CRC.v[2])->bits.b7;
+
+		// Set the proper bit in the Hash Table
+		BFSReg(HTRegister, 1<<i);
+
+		// Ensure that the Hash Table receive filter is enabled
+		BFSReg((BYTE)ERXFCON, ERXFCON_HTEN);
+	}
 
     BankSel(ERDPTL);            // Return to Bank 0
 }

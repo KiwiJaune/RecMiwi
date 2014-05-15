@@ -35,14 +35,13 @@
 ********************************************************************/
 #include <string.h>
 
-#include "GenericTypeDefs.h"
 
 #include "TCPIP Stack/TCPIP.h"
 #include "TCPIP Stack/MAC.h"
 
 
-// Compile only for PIC32MX with Ethernet MAC interface (must not have external ENCX24J600, ENC28J60, or ZG2100M hardware defined)
-#if defined(__PIC32MX__) && defined(_ETH) && !defined(ENC100_INTERFACE_MODE) && !defined(ENC_CS_TRIS) && !defined(ZG_CS_TRIS)
+// Compile only for PIC32MX with Ethernet MAC interface (must not have external ENCX24J600, ENC28J60, or MRF24WB0M hardware defined)
+#if defined(__PIC32MX__) && defined(_ETH) && !defined(ENC100_INTERFACE_MODE) && !defined(ENC_CS_TRIS) && !defined(WF_CS_TRIS)
 
 // running on PIC32MX5-7 family with embedded ETHC
 
@@ -69,8 +68,10 @@ typedef struct
 /******************************************************************************
  * Prototypes
  ******************************************************************************/
-static void		_TxAckCallback(void* pPktBuff, int buffIx);			// Eth tx buffer acnowledge function
+static void		_TxAckCallback(void* pPktBuff, int buffIx, void* fParam);			// Eth tx buffer acnowledge function
 static int		_LinkReconfigure(void);						// link reconfiguration
+
+static void*    _MacAllocCallback( size_t nitems, size_t size, void* param );
 
 
 // TX buffers
@@ -132,7 +133,7 @@ static int			_linkNegotiation;					// if an auto-negotiation is in effect
  * Overview:        This function initializes the Eth controller, the MAC and the PHY. It should be called to be able to schedule
  *                  any Eth transmit or receive operation.
  *
- * Note:           The flags used for EthOpen() call are fixed for now. This will change in the future! 
+ * Note:            None 
  *****************************************************************************/
 void MACInit(void)
 {
@@ -169,7 +170,7 @@ void MACInit(void)
 	{
 		eEthLinkStat	linkStat;
 		eEthOpenFlags	oFlags, linkFlags;
-		eMacPauseType	pauseType;
+		eEthMacPauseType pauseType;
 		eEthPhyCfgFlags cfgFlags;
 
 
@@ -206,7 +207,7 @@ void MACInit(void)
 	#endif // ETH_CFG_LINK
 
 		
-		pauseType=(oFlags&ETH_OPEN_FDUPLEX)?MAC_PAUSE_CPBL_MASK:MAC_PAUSE_TYPE_NONE;
+		pauseType=(oFlags&ETH_OPEN_FDUPLEX)?ETH_MAC_PAUSE_CPBL_MASK:ETH_MAC_PAUSE_TYPE_NONE;
 		
 		// start the initialization sequence	
 		EthInit();
@@ -234,12 +235,12 @@ void MACInit(void)
 			EthMACSetAddress(SysMACAddr.addr);                
         }
 				
-		if(EthDescriptorsAdd(EMAC_TX_DESCRIPTORS, ETH_DCPT_TYPE_TX, 0)!=EMAC_TX_DESCRIPTORS)
+		if(EthDescriptorsPoolAdd(EMAC_TX_DESCRIPTORS, ETH_DCPT_TYPE_TX, _MacAllocCallback, 0)!=EMAC_TX_DESCRIPTORS)
 		{
 			initFail++;
 		}
 
-		if(EthDescriptorsAdd(EMAC_RX_DESCRIPTORS, ETH_DCPT_TYPE_RX, 0)!=EMAC_RX_DESCRIPTORS)
+		if(EthDescriptorsPoolAdd(EMAC_RX_DESCRIPTORS, ETH_DCPT_TYPE_RX, _MacAllocCallback, 0)!=EMAC_RX_DESCRIPTORS)
 		{
 			initFail++;
 		}
@@ -249,8 +250,8 @@ void MACInit(void)
 		// set the RX buffers as permanent receive buffers
 		for(ix=0, ethRes=ETH_RES_OK; ix<EMAC_RX_DESCRIPTORS && ethRes==ETH_RES_OK; ix++)
 		{
-			unsigned char* pRxBuff=_RxBuffers[ix];
-			ethRes=EthRxBuffersAppend(&pRxBuff, 1, BUFF_FLAG_RX_STICKY);
+			void* pRxBuff=_RxBuffers[ix];
+			ethRes=EthRxBuffersAppend(&pRxBuff, 1, ETH_BUFF_FLAG_RX_STICKY);
 		}
 
 		if(ethRes!=ETH_RES_OK)
@@ -422,7 +423,7 @@ BOOL MACIsTxReady(void)
 {
 	int	ix;
 
-	EthTxAckBuffer(0, _TxAckCallback);		// acknowledge everything
+	EthTxAcknowledgeBuffer(0, _TxAckCallback, 0);		// acknowledge everything
 
 	if(_pTxCurrDcpt==0)
 	{
@@ -580,7 +581,7 @@ void MACDiscardRx(void)
 {
 	if(_pRxCurrBuff)
 	{	// an already existing packet
-		EthRxAckBuffer(_pRxCurrBuff, 0);
+		EthRxAcknowledgeBuffer(_pRxCurrBuff, 0, 0);
 		_pRxCurrBuff=0;
 		_RxCurrSize=0;
 
@@ -616,7 +617,7 @@ void MACDiscardRx(void)
 BOOL MACGetHeader(MAC_ADDR *remote, BYTE* type)
 {
 	void*			pNewPkt;
-	const sRxPktStat*	pRxPktStat;
+	const sEthRxPktStat*	pRxPktStat;
 	eEthRes			res;
 
 	_stackMgrInGetHdr++;
@@ -679,7 +680,7 @@ BOOL MACGetHeader(MAC_ADDR *remote, BYTE* type)
 
 	if(_pRxCurrBuff==0 && pNewPkt)
 	{	// failed packet, discard
-		EthRxAckBuffer(pNewPkt, 0);
+		EthRxAcknowledgeBuffer(pNewPkt, 0, 0);
 		_stackMgrRxBadPkts++;
 	}
 		
@@ -949,28 +950,127 @@ WORD MACCalcRxChecksum(WORD offset, WORD len)
 	return CalcIPChecksum(_pRxCurrBuff+sizeof(ETHER_HEADER)+offset, len);
 }
 
+/******************************************************************************
+ * Function:        void SetRXHashTableEntry(MAC_ADDR DestMACAddr)
+ *
+ * PreCondition:    MACInit() should have been called.
+ *
+ * Input:           DestMACAddr: 6 byte group destination MAC address to allow 
+ *                  through the Hash Table Filter.  If DestMACAddr 
+ *                  is set to 00-00-00-00-00-00, then the hash 
+ *                  table will be cleared of all entries and the 
+ *                  filter will be disabled.
+ *
+ * Output:          Sets the appropriate bit in the ETHHT0/1 registers to allow 
+ *                  packets sent to DestMACAddr to be received and enabled the 
+ *                  Hash Table receive filter (if not already).
+ *
+ * Side Effects:    None
+ *
+ * Overview:        Calculates a CRC-32 using polynomial 0x4C11DB7 and then,
+ *                  using bits 28:23 of the CRC, sets the appropriate bit in 
+ *                  the ETHHT0-ETHHT1 registers.
+ *
+ * Note:            This code is commented out to save code space on systems 
+ *                  that do not need this function.  Change the 
+ *                  "#if STACK_USE_ZEROCONF_MDNS_SD" line to "#if 1" to 
+ *                  uncomment it, assuming you aren't using the Zeroconf module, 
+ *                  which requires mutlicast support and enables this function 
+ *                  automatically.
+ *
+ *                  There is no way to individually unset destination MAC 
+ *                  addresses from the hash table since it is possible to have 
+ *                  a hash collision and therefore multiple MAC addresses 
+ *                  relying on the same hash table bit.  The stack would have 
+ *                  to individually store each 6 byte MAC address to support 
+ *                  this feature, which would waste a lot of RAM and be 
+ *                  unnecessary in most applications.  As a simple compromise, 
+ *                  you can call SetRXHashTableEntry() using a 
+ *                  00-00-00-00-00-00 destination MAC address, which will clear 
+ *                  the entire hash table and disable the hash table filter.  
+ *                  This will allow you to then readd the necessary destination 
+ *                  addresses.
+ *****************************************************************************/
+#if defined(STACK_USE_ZEROCONF_MDNS_SD)
+void SetRXHashTableEntry(MAC_ADDR DestMACAddr)
+{
+      volatile unsigned int*    pHTSet;
+      BYTE                      hVal;
+      int                       i, j;
+      DWORD_VAL                 crc = {0xFFFFFFFF};
+      BYTE                      nullMACAddr[6] =   {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+      // Clear the Hash Table bits and disable the Hash Table Filter if a special 
+      // 00-00-00-00-00-00 destination MAC address is provided.
+      if( memcmp(DestMACAddr.v, nullMACAddr, sizeof(nullMACAddr))==0 )
+      {
+            // Disable the Hash Table receive filter and clear the hash table
+            EthRxFiltersClr(ETH_FILT_HTBL_ACCEPT);
+            EthRxFiltersHTSet(0ull);
+            return;
+      }
+ 
+ 
+      // Calculate a CRC-32 over the 6 byte MAC address 
+      // using polynomial 0x4C11DB7
+      for(i = 0; i < sizeof(MAC_ADDR); i++)
+      {
+            BYTE  crcnext;
+      
+            // shift in 8 bits
+            for(j = 0; j < 8; j++)
+            {
+                  crcnext = 0;
+                  if(((BYTE_VAL*)&(crc.v[3]))->bits.b7)
+                        crcnext = 1;
+                  crcnext ^= (((BYTE_VAL*)&DestMACAddr.v[i])->bits.b0);
+      
+                  crc.Val <<= 1;
+                  if(crcnext)
+                        crc.Val ^= 0x4C11DB7;
+                  // next bit
+                  DestMACAddr.v[i] >>= 1;
+            }
+      }
+      
+      // CRC-32 calculated, now extract bits 28:23
+      // Bit 28 defines what HT register is affected: ETHHT0 or ETHHT1
+      // Bits 27:23 define the bit offset within the ETHHT register
+      pHTSet = (crc.bits.b28)? &ETHHT1SET : &ETHHT0SET;
+      hVal = (crc.Val >> 23)&0x1f;
+      *pHTSet = 1 << hVal;
+      
+      // Enable that the Hash Table receive filter
+      EthRxFiltersSet(ETH_FILT_HTBL_ACCEPT);
+      
+}
+#endif
+ 
+
 
 /**************************
  * local functions and helpers
  ***********************************************/
 
 /*********************************************************************
-* Function:        void	_TxAckCallback(void* pPktBuff)
+* Function:        void	_TxAckCallback(void* pPktBuff, int buffIx, void* fParam)
  *
  * PreCondition:    None
  * 
  * Input:           pPktBuff - tx buffer to be acknowledged
+ *                  buffIx   - buffer index, when packet spans multiple buffers
+ *                  fParam   - optional parameter specified when EthTxAcknowledgeBuffer() called 
  * 
  * Output:          None
  * 
  * Side Effects:    None
  * 
  * Overview:        TX acknowledge call back function.
- *                  Called by the Eth MAC when TX buffers are acknoledged (as a result of a call to EthTxAckBuffer).
+ *                  Called by the Eth MAC when TX buffers are acknoledged (as a result of a call to EthTxAcknowledgeBuffer).
  * 
  * Note:            None
  ********************************************************************/
-static void	_TxAckCallback(void* pPktBuff, int buffIx)
+static void	_TxAckCallback(void* pPktBuff, int buffIx, void* fParam)
 {
 	volatile sEthTxDcpt*	pDcpt;
 
@@ -980,6 +1080,27 @@ static void	_TxAckCallback(void* pPktBuff, int buffIx)
 
 }
 
+/*********************************************************************
+* Function:        void* _MacAllocCallback( size_t nitems, size_t size, void* param )
+ *
+ * PreCondition:    None
+ * 
+ * Input:           nitems - number of items to be allocated
+ *                  size   - size of each item
+ *                  param  - optional parameter specified when EthDescriptorsPoolAdd() called 
+ * 
+ * Output:          pointer to the allocated memory of NULL if allocation failed
+ * 
+ * Side Effects:    None
+ * 
+ * Overview:        Memory allocation callback.
+ * 
+ * Note:            None
+ ********************************************************************/
+static void* _MacAllocCallback( size_t nitems, size_t size, void* param )
+{
+    return calloc(nitems, size);
+}
 
 /*********************************************************************
 * Function:        int	_LinkReconfigure(void)
@@ -1000,11 +1121,11 @@ static void	_TxAckCallback(void* pPktBuff, int buffIx)
 static int _LinkReconfigure(void)
 {
 
-	eEthOpenFlags	linkFlags;
-	eEthLinkStat	linkStat;
-	eMacPauseType	pauseType;
-	eEthRes		phyRes;
-	int		success=0;
+	eEthOpenFlags	 linkFlags;
+	eEthLinkStat	 linkStat;
+	eEthMacPauseType pauseType;
+	eEthRes		     phyRes;
+	int	        	 success=0;
 
 
 	phyRes=EthPhyNegotiationComplete(0);	// see if negotiation complete
@@ -1013,11 +1134,7 @@ static int _LinkReconfigure(void)
 		linkStat=EthPhyGetNegotiationResult(&linkFlags, &pauseType);
 		if(linkStat&ETH_LINK_ST_UP)
 		{	// negotiation succeeded; properly update the MAC
-		#ifdef PHY_RMII
-			EthMIIMInit(GetSystemClock(), EthPhyMIIMClock(), linkFlags, 1);
-		#else
-			EthMIIMInit(GetSystemClock(), EthPhyMIIMClock(), linkFlags, 0);
-		#endif
+            linkFlags|=(EthPhyGetHwConfigFlags()&ETH_PHY_CFG_RMII)?ETH_OPEN_RMII:ETH_OPEN_MII;                       
 			EthMACOpen(linkFlags, pauseType);
 			success=1;
 		}

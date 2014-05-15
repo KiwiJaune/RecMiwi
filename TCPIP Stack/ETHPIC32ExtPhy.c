@@ -40,14 +40,15 @@
 
 #include <plib.h>
 
-// Compile only for PIC32MX with Ethernet MAC interface (must not have external ENCX24J600, ENC28J60, or ZG2100M hardware defined)
-#if defined(__PIC32MX__) && defined(_ETH) && !defined(ENC100_INTERFACE_MODE) && !defined(ENC_CS_TRIS) && !defined(ZG_CS_TRIS)
+#include "HardwareProfile.h"
+
+// Compile only for PIC32MX with Ethernet MAC interface (must not have external ENCX24J600, ENC28J60, or MRF24WB0M hardware defined)
+#if defined(__PIC32MX__) && defined(_ETH) && !defined(ENC100_INTERFACE_MODE) && !defined(ENC_CS_TRIS) && !defined(WF_CS_TRIS)
 
 #include "TCPIP Stack/ETHPIC32ExtPhy.h"
 
 #include "TCPIP Stack/ETHPIC32ExtPhyRegs.h"
 
-#include "HardwareProfile.h"
 
 
 // local definitions 
@@ -87,18 +88,87 @@ static __inline__ eEthLinkStat __attribute__((always_inline)) _Phy2LinkStat(__BM
 	return linkStat;	
 }
 
+static __inline__ unsigned short __attribute__((always_inline)) _PhyReadReg( unsigned int rIx, unsigned int phyAdd )
+{
+    EthMIIMReadStart(rIx, phyAdd);
+    return EthMIIMReadResult();
+}
 
 
 /****************************************************************************
  *                 interface functions
  ****************************************************************************/
 
+/****************************************************************************
+ * Function:        EthPhyRestartNegotiation
+ *
+ * PreCondition:    - EthPhyInit should have been called.
+ *                  - The PHY should have been initialized with proper duplex/speed mode!
+ *
+ * Input:           None
+ *
+ * Output:          ETH_RES_OK for success,
+ *                  ETH_RES_NEGOTIATION_UNABLE if the auto-negotiation is not supported.
+ *
+ * Side Effects:    None
+ *
+ * Overview:        This function restarts the PHY negotiation.
+ *                  After this restart the link can be reconfigured.
+ *                  The EthPhyGetNegotiationResults() can be used to see the outcoming result.
+ *
+ * Note:            None
+ *****************************************************************************/
+eEthRes  __attribute__((weak)) EthPhyRestartNegotiation(void)
+{
+	eEthRes	res;
+	__BMSTATbits_t	phyCpbl;
+	
+	phyCpbl.w=_PhyReadReg(PHY_REG_BMSTAT, _PhyAdd);
+ 
+	if(phyCpbl.AN_ABLE)
+	{	// ok, we can perform auto negotiation
+		EthMIIMWriteStart(PHY_REG_BMCON, _PhyAdd, _BMCON_AN_ENABLE_MASK|_BMCON_AN_RESTART_MASK);	// restart negotiation and we'll have to wait
+		res=ETH_RES_OK;
+	}
+	else
+	{
+		res=ETH_RES_NEGOTIATION_UNABLE;		// no negotiation ability!
+	}
 
+	return res;
+}
+
+
+/****************************************************************************
+ * Function:        EthPhyGetHwConfigFlags
+ *
+ * PreCondition:    - EthPhyInit should have been called.
+ *
+ * Input:           None  
+ *
+ * Output:          a eEthPhyCfgFlags value
+ *
+ *
+ * Side Effects:    None
+ *
+ * Overview:        This function returns the current PHY hardware MII/RMII and ALTERNATE/DEFAULT configuration flags.
+ *
+ * Note:            None
+ *****************************************************************************/
+eEthPhyCfgFlags __attribute__((weak)) EthPhyGetHwConfigFlags(void)
+{
+    eEthPhyCfgFlags hwFlags;
+    // the way the hw is configured
+    hwFlags=(DEVCFG3bits.FMIIEN!=0)?ETH_PHY_CFG_MII:ETH_PHY_CFG_RMII;
+    hwFlags|=(DEVCFG3bits.FETHIO!=0)?ETH_PHY_CFG_DEFAULT:ETH_PHY_CFG_ALTERNATE;
+
+    return hwFlags;
+}
 
 /****************************************************************************
  * Function:        EthPhyInit
  *
- * PreCondition:    - EthOpen should have been called.
+ * PreCondition:    - EthInit should have been called.
  *
  * Input:           oFlags - the requested open flags
  *                  cFlags - PHY MII/RMII configuration flags
@@ -125,8 +195,7 @@ eEthRes __attribute__((weak)) EthPhyInit(eEthOpenFlags oFlags, eEthPhyCfgFlags c
 	eEthRes	res;
 
 	// the way the hw is configured
-	hwFlags=(DEVCFG3bits.FMIIEN!=0)?ETH_PHY_CFG_MII:ETH_PHY_CFG_RMII;
-	hwFlags|=(DEVCFG3bits.FETHIO!=0)?ETH_PHY_CFG_DEFAULT:ETH_PHY_CFG_ALTERNATE;
+    hwFlags=EthPhyGetHwConfigFlags();
 
 	if(cFlags&ETH_PHY_CFG_AUTO)
 	{
@@ -156,9 +225,11 @@ eEthRes __attribute__((weak)) EthPhyInit(eEthOpenFlags oFlags, eEthPhyCfgFlags c
 		oFlags&=~ETH_OPEN_MDIX_AUTO;		// Auto-MDIX has to be in auto negotiation only
 	}
 	
+    oFlags|=(cFlags&ETH_PHY_CFG_RMII)?ETH_OPEN_RMII:ETH_OPEN_MII;
+    
 	_PhyInitIo();	// init IO pins
 
-	EthMIIMInit(GetSystemClock(), EthPhyMIIMClock(), oFlags, (cFlags&ETH_PHY_CFG_RMII)!=0);
+	EthMIIMConfig(GetSystemClock(), EthPhyMIIMClock());
 
 
 	// try to detect the PHY and reset it
@@ -218,7 +289,7 @@ eEthRes __attribute__((weak)) EthPhyInit(eEthOpenFlags oFlags, eEthPhyCfgFlags c
 	}
 	
 	// try to match the oFlags with the PHY capabilities
-	phyCpbl=EthMIIMReadReg(PHY_REG_BMSTAT, _PhyAdd);
+	phyCpbl=_PhyReadReg(PHY_REG_BMSTAT, _PhyAdd);
 	matchCpbl=(openReqs&(MAC_COMM_CPBL_MASK|_BMSTAT_AN_ABLE_MASK))&phyCpbl;	// common features
 	if(!(matchCpbl&MAC_COMM_CPBL_MASK))
 	{	// no match?
@@ -243,16 +314,16 @@ eEthRes __attribute__((weak)) EthPhyInit(eEthOpenFlags oFlags, eEthPhyCfgFlags c
 		unsigned short	anadReg;
 
 		anadReg=(((matchCpbl>>_BMSTAT_NEGOTIATION_POS)<<_ANAD_NEGOTIATION_POS)&_ANAD_NEGOTIATION_MASK)|PROT_802_3;
-		if(MAC_PAUSE_CPBL_MASK&MAC_PAUSE_TYPE_PAUSE)
+		if(ETH_MAC_PAUSE_CPBL_MASK & ETH_MAC_PAUSE_TYPE_PAUSE)
 		{
 			anadReg|=_ANAD_PAUSE_MASK;
 		}
-		if(MAC_PAUSE_CPBL_MASK&MAC_PAUSE_TYPE_ASM_DIR)
+		if(ETH_MAC_PAUSE_CPBL_MASK& ETH_MAC_PAUSE_TYPE_ASM_DIR)
 		{
 			anadReg|=_ANAD_ASM_DIR_MASK;
 		}
 
-		EthMIIMWriteReg(PHY_REG_ANAD, _PhyAdd, anadReg);		// advertise our capabilities
+		EthMIIMWriteStart(PHY_REG_ANAD, _PhyAdd, anadReg);		// advertise our capabilities
 						
 		EthPhyRestartNegotiation();	// restart negotiation and we'll have to wait
 	}
@@ -275,7 +346,7 @@ eEthRes __attribute__((weak)) EthPhyInit(eEthOpenFlags oFlags, eEthPhyCfgFlags c
 			ctrlReg|=_BMCON_LOOPBACK_MASK;
 		}
 		
-		EthMIIMWriteReg(PHY_REG_BMCON, _PhyAdd, ctrlReg);	// update the configuration
+		EthMIIMWriteStart(PHY_REG_BMCON, _PhyAdd, ctrlReg);	// update the configuration
 	}
 
 
@@ -314,50 +385,9 @@ eEthRes __attribute__((weak)) EthPhyInit(eEthOpenFlags oFlags, eEthPhyCfgFlags c
 
 
 /****************************************************************************
- * Function:        EthPhyRestartNegotiation
- *
- * PreCondition:    - EthOpen should have been called.
- *                  - The PHY should have been initialized with proper duplex/speed mode!
- *
- * Input:           None
- *
- * Output:          ETH_RES_OK for success,
- *                  ETH_RES_NEGOTIATION_UNABLE if the auto-negotiation is not supported.
- *
- * Side Effects:    None
- *
- * Overview:        This function restarts the PHY negotiation.
- *                  After this restart the link can be reconfigured.
- *                  The EthPhyGetNegotiationResults() can be used to see the outcoming result.
- *
- * Note:            None
- *****************************************************************************/
-eEthRes  __attribute__((weak)) EthPhyRestartNegotiation(void)
-{
-	eEthRes	res;
-	__BMSTATbits_t	phyCpbl;
-	
-	phyCpbl.w=EthMIIMReadReg(PHY_REG_BMSTAT, _PhyAdd);
- 
-	if(phyCpbl.AN_ABLE)
-	{	// ok, we can perform auto negotiation
-		EthMIIMWriteReg(PHY_REG_BMCON, _PhyAdd, _BMCON_AN_ENABLE_MASK|_BMCON_AN_RESTART_MASK);	// restart negotiation and we'll have to wait
-		res=ETH_RES_OK;
-	}
-	else
-	{
-		res=ETH_RES_NEGOTIATION_UNABLE;		// no negotiation ability!
-	}
-
-	return res;
-}
-
-
-
-/****************************************************************************
  * Function:        EthPhyNegotiationComplete
  *
- * PreCondition:    EthOpen (and EthPhyRestartNegotiation) should have been called.
+ * PreCondition:    EthPhyInit (and EthPhyRestartNegotiation) should have been called.
  *
  * Input:           waitComplete - if wait for completion needed
  *
@@ -379,11 +409,11 @@ eEthRes  __attribute__((weak)) EthPhyNegotiationComplete(int waitComplete)
 	__BMSTATbits_t	phyStat;
 	eEthRes	res;
 	
-	phyBMCon.w=EthMIIMReadReg(PHY_REG_BMCON, _PhyAdd);
+	phyBMCon.w=_PhyReadReg(PHY_REG_BMCON, _PhyAdd);
 	if(phyBMCon.AN_ENABLE)
 	{	// just protect from an accidental call
-		phyBMCon.w=EthMIIMReadReg(PHY_REG_BMCON, _PhyAdd);
-		phyStat.w=EthMIIMReadReg(PHY_REG_BMSTAT, _PhyAdd);
+		phyBMCon.w=_PhyReadReg(PHY_REG_BMCON, _PhyAdd);
+		phyStat.w=_PhyReadReg(PHY_REG_BMSTAT, _PhyAdd);
 
 		if(waitComplete)
 		{
@@ -395,7 +425,7 @@ eEthRes  __attribute__((weak)) EthPhyNegotiationComplete(int waitComplete)
 				tStart=ReadCoreTimer();
 				do
 				{
-					phyBMCon.w=EthMIIMReadReg(PHY_REG_BMCON, _PhyAdd);
+					phyBMCon.w=_PhyReadReg(PHY_REG_BMCON, _PhyAdd);
 				}while(phyBMCon.AN_RESTART && (ReadCoreTimer()-tStart)<tWait);		// wait auto negotiation start
 			}
 
@@ -405,10 +435,10 @@ eEthRes  __attribute__((weak)) EthPhyNegotiationComplete(int waitComplete)
 				tStart=ReadCoreTimer();
 				do
 				{
-					phyStat.w=EthMIIMReadReg(PHY_REG_BMSTAT, _PhyAdd);
+					phyStat.w=_PhyReadReg(PHY_REG_BMSTAT, _PhyAdd);
 				}while(phyStat.AN_COMPLETE==0 && (ReadCoreTimer()-tStart)<tWait);	// wait auto negotiation done
 
-				phyStat.w=EthMIIMReadReg(PHY_REG_BMSTAT, _PhyAdd);
+				phyStat.w=_PhyReadReg(PHY_REG_BMSTAT, _PhyAdd);
 			}
 		}
 	}
@@ -434,7 +464,7 @@ eEthRes  __attribute__((weak)) EthPhyNegotiationComplete(int waitComplete)
 /****************************************************************************
  * Function:        EthPhyGetNegotiationResult
  *
- * PreCondition:    EthOpen, EthPhyRestartNegotiation and EthPhyNegotiationComplete should have been called.
+ * PreCondition:    EthPhyInit, EthPhyRestartNegotiation and EthPhyNegotiationComplete should have been called.
  *
  * Input:           pFlags     - address to store the negotiation result
  *                  pPauseType - address to store the pause type supported by the LP
@@ -448,7 +478,7 @@ eEthRes  __attribute__((weak)) EthPhyNegotiationComplete(int waitComplete)
  *
  * Note:            If no negotiation possible/active/failed, most likely the flags are invalid!
  *****************************************************************************/
-eEthLinkStat  __attribute__((weak)) EthPhyGetNegotiationResult(eEthOpenFlags* pFlags, eMacPauseType* pPauseType)
+eEthLinkStat  __attribute__((weak)) EthPhyGetNegotiationResult(eEthOpenFlags* pFlags, eEthMacPauseType* pPauseType)
 {
 	eEthLinkStat	linkStat;
 	eEthOpenFlags	oFlags;
@@ -456,7 +486,7 @@ eEthLinkStat  __attribute__((weak)) EthPhyGetNegotiationResult(eEthOpenFlags* pF
 	__ANEXPbits_t	phyExp;
 	__ANLPADbits_t	lpAD;
 	__ANADbits_t	anadReg;
-	eMacPauseType	pauseType;
+	eEthMacPauseType pauseType;
 
 	
 	//	should have BMCON.AN_ENABLE==1
@@ -464,9 +494,9 @@ eEthLinkStat  __attribute__((weak)) EthPhyGetNegotiationResult(eEthOpenFlags* pF
 
 
 	oFlags=0;	// don't know the result yet
-	pauseType=MAC_PAUSE_TYPE_NONE;
+	pauseType=ETH_MAC_PAUSE_TYPE_NONE;
 
-	phyStat.w=EthMIIMReadReg(PHY_REG_BMSTAT, _PhyAdd);
+	phyStat.w=_PhyReadReg(PHY_REG_BMSTAT, _PhyAdd);
 	if(phyStat.AN_COMPLETE==0)
 	{
 		linkStat=(ETH_LINK_ST_DOWN|ETH_LINK_ST_NEG_TMO);
@@ -481,16 +511,16 @@ eEthLinkStat  __attribute__((weak)) EthPhyGetNegotiationResult(eEthOpenFlags* pF
 	
 		linkStat=ETH_LINK_ST_UP;
 
-		lcl_Pause=(MAC_PAUSE_CPBL_MASK&MAC_PAUSE_TYPE_PAUSE)?1:0;
-		lcl_AsmDir=(MAC_PAUSE_CPBL_MASK&MAC_PAUSE_TYPE_ASM_DIR)?1:0;
+		lcl_Pause=(ETH_MAC_PAUSE_CPBL_MASK & ETH_MAC_PAUSE_TYPE_PAUSE)?1:0;
+		lcl_AsmDir=(ETH_MAC_PAUSE_CPBL_MASK & ETH_MAC_PAUSE_TYPE_ASM_DIR)?1:0;
 		lp_Pause=lp_AsmDir=0;			// in case negotiation fails
 		lpAD.w=_ANAD_BASE10T_MASK;		// lowest priority resolution
 				
-		phyExp.w=EthMIIMReadReg(PHY_REG_ANEXP, _PhyAdd);
+		phyExp.w=_PhyReadReg(PHY_REG_ANEXP, _PhyAdd);
 		if(phyExp.LP_AN_ABLE)
 		{	// ok,valid auto negotiation info
 
-			lpAD.w=EthMIIMReadReg(PHY_REG_ANLPAD, _PhyAdd);
+			lpAD.w=_PhyReadReg(PHY_REG_ANLPAD, _PhyAdd);
 			if(lpAD.REM_FAULT)
 			{
 				linkStat|=ETH_LINK_ST_REMOTE_FAULT;
@@ -519,7 +549,7 @@ eEthLinkStat  __attribute__((weak)) EthPhyGetNegotiationResult(eEthOpenFlags* pF
 	
 		// set the PHY connection params
 		
-		anadReg.w=EthMIIMReadReg(PHY_REG_ANAD, _PhyAdd);		// get our advertised capabilities
+		anadReg.w=_PhyReadReg(PHY_REG_ANAD, _PhyAdd);		// get our advertised capabilities
 		anadReg.w&=lpAD.w;				// get the matching ones
 		// get the settings, according to IEEE 802.3 Annex 28B.3 Priority Resolution
 		// Note: we don't support 100BaseT4 !
@@ -553,11 +583,11 @@ eEthLinkStat  __attribute__((weak)) EthPhyGetNegotiationResult(eEthOpenFlags* pF
 		{	// pause type relevant for full duplex only
 			if(lp_Pause & (lcl_Pause|(lcl_AsmDir&lp_AsmDir)))
 			{
-				pauseType=MAC_PAUSE_TYPE_EN_TX;
+				pauseType=ETH_MAC_PAUSE_TYPE_EN_TX;
 			}
 			if(lcl_Pause & (lp_Pause | (lcl_AsmDir&lp_AsmDir)))
 			{
-				pauseType|=MAC_PAUSE_TYPE_EN_RX;
+				pauseType|=ETH_MAC_PAUSE_TYPE_EN_RX;
 			}
 		}
 	}
@@ -577,7 +607,7 @@ eEthLinkStat  __attribute__((weak)) EthPhyGetNegotiationResult(eEthOpenFlags* pF
 /****************************************************************************
  * Function:        EthPhyGetLinkStatus
  *
- * PreCondition:    EthOpen should have been called.
+ * PreCondition:    EthPhyInit should have been called.
  *
  * Input:           refresh - boolean to specify if double read is needed.
  *
@@ -596,10 +626,10 @@ eEthLinkStat  __attribute__((weak)) EthPhyGetLinkStatus(int refresh)
 	__BMSTATbits_t	phyStat;
 	
 	// read the link status
-	phyStat.w=EthMIIMReadReg(PHY_REG_BMSTAT, _PhyAdd);
+	phyStat.w=_PhyReadReg(PHY_REG_BMSTAT, _PhyAdd);
 	if(phyStat.LINK_STAT==0 && refresh)
 	{	// link down could be an old condition. re-read
-		phyStat.w=EthMIIMReadReg(PHY_REG_BMSTAT, _PhyAdd);
+		phyStat.w=_PhyReadReg(PHY_REG_BMSTAT, _PhyAdd);
 	}
 
 	return _Phy2LinkStat(phyStat);
@@ -627,7 +657,7 @@ eEthLinkStat  __attribute__((weak)) EthPhyGetLinkStatus(int refresh)
 int  __attribute__((weak)) EthPhyReset(int waitComplete)
 {
 
-	EthMIIMWriteReg(PHY_REG_BMCON, _BMCON_RESET_MASK, _PhyAdd);		// Soft Reset the PHY
+	EthMIIMWriteStart(PHY_REG_BMCON, _PhyAdd, _BMCON_RESET_MASK);		// Soft Reset the PHY
 	
 	if(waitComplete)
 	{	// wait reset self clear
@@ -638,10 +668,10 @@ int  __attribute__((weak)) EthPhyReset(int waitComplete)
 		tStart=ReadCoreTimer();
 		do
 		{
-			bmcon.w=EthMIIMReadReg(PHY_REG_BMCON, _PhyAdd);
+			bmcon.w=_PhyReadReg(PHY_REG_BMCON, _PhyAdd);
 		}while(bmcon.RESET && (ReadCoreTimer()-tStart)<tWaitReset);
 
-		bmcon.w=EthMIIMReadReg(PHY_REG_BMCON, _PhyAdd);
+		bmcon.w=_PhyReadReg(PHY_REG_BMCON, _PhyAdd);
 		if(bmcon.RESET)
 		{	// tmo clearing the reset
 			return 0;
@@ -701,7 +731,7 @@ eEthLinkStat __attribute__((weak)) EthPhyScanLinkRead(void)
 {
 	__BMSTATbits_t	phyStat;
 	
-	phyStat.w=EthMIIMScanRead();
+	phyStat.w=EthMIIMScanResult();
 
 	return _Phy2LinkStat(phyStat);
 }
@@ -826,7 +856,7 @@ static void _PhyInitIo(void)
 /****************************************************************************
  * Function:        _PhyDetectReset
  *
- * PreCondition:    EthMIIMInit() should have been called
+ * PreCondition:    EthMIIMConfig() should have been called
  *
  * Input:           None
  *
@@ -844,7 +874,7 @@ static int _PhyDetectReset(void)
 	__BMCONbits_t bmcon;
 	unsigned int	tStart, tWaitReset;
 
-	bmcon.w=EthMIIMReadReg(PHY_REG_BMCON, _PhyAdd);		// read the BMCON register
+	bmcon.w=_PhyReadReg(PHY_REG_BMCON, _PhyAdd);		// read the BMCON register
 
 	if(bmcon.RESET)
 	{	// that is already suspicios...but give it a chance to clear itself
@@ -852,10 +882,10 @@ static int _PhyDetectReset(void)
 		tStart=ReadCoreTimer();
 		do
 		{
-			bmcon.w=EthMIIMReadReg(PHY_REG_BMCON, _PhyAdd);
+			bmcon.w=_PhyReadReg(PHY_REG_BMCON, _PhyAdd);
 		}while(bmcon.RESET && (ReadCoreTimer()-tStart)<tWaitReset);	// wait reset self clear
 
-		bmcon.w=EthMIIMReadReg(PHY_REG_BMCON, _PhyAdd);
+		bmcon.w=_PhyReadReg(PHY_REG_BMCON, _PhyAdd);
 		if(bmcon.RESET)
 		{	// tmo clearing the reset
 			return 0;
@@ -865,15 +895,15 @@ static int _PhyDetectReset(void)
 	// ok, reset bit is low
 	// try to see if we can write smth to the PHY
 	// we use Loopback and Isolate bits
-	EthMIIMWriteReg(PHY_REG_BMCON, _PhyAdd, _BMCON_LOOPBACK_MASK|_BMCON_ISOLATE_MASK);	// write control bits
-	bmcon.w=EthMIIMReadReg(PHY_REG_BMCON, _PhyAdd);		// read back
+	EthMIIMWriteStart(PHY_REG_BMCON, _PhyAdd, _BMCON_LOOPBACK_MASK|_BMCON_ISOLATE_MASK);	// write control bits
+	bmcon.w=_PhyReadReg(PHY_REG_BMCON, _PhyAdd);		// read back
 	if(bmcon.LOOPBACK==0 || bmcon.ISOLATE==0)
 	{	// failed to set
 		return 0;
 	}
 	bmcon.w^=_BMCON_LOOPBACK_MASK|_BMCON_ISOLATE_MASK;
-	EthMIIMWriteReg(PHY_REG_BMCON, _PhyAdd, bmcon.w);		// clear bits and write
-	bmcon.w=EthMIIMReadReg(PHY_REG_BMCON, _PhyAdd);		// read back
+	EthMIIMWriteStart(PHY_REG_BMCON, _PhyAdd, bmcon.w);		// clear bits and write
+	bmcon.w=_PhyReadReg(PHY_REG_BMCON, _PhyAdd);		// read back
 	if(bmcon.LOOPBACK || bmcon.ISOLATE)
 	{	// failed to clear
 		return 0;

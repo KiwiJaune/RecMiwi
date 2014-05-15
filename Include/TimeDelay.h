@@ -56,11 +56,11 @@ Date        Comments
   Remarks:
     None
   ***************************************************************************/
-void Delay10usMiwi( UINT32 tenMicroSecondCounter );
+void Delay10us( UINT32 tenMicroSecondCounter );
 
 /****************************************************************************
   Function:
-    void DelayMsMiwi( UINT16 ms )
+    void DelayMs( UINT16 ms )
 
   Description:
     This routine performs a software delay in intervals of 1 millisecond.
@@ -77,4 +77,4 @@ void Delay10usMiwi( UINT32 tenMicroSecondCounter );
   Remarks:
     None
   ***************************************************************************/
-void DelayMsMiwi( UINT16 ms );
+void DelayMs( UINT16 ms );

@@ -61,8 +61,10 @@
 
 #include "TCPIP Stack/TCPIP.h"
 
+// NetBIOS Name Service port
 #define NBNS_PORT		(137u)
 
+// NBNS Header structure
 typedef struct _NBNS_HEADER
 {
 	WORD_VAL TransactionID;
@@ -86,11 +88,11 @@ extern NODE_INFO remoteNode;
  *
  * Input:           None
  *
- * Output:          Sends responses to NetBIOS name requests
+ * Output:          None
  *
  * Side Effects:    None
  *
- * Overview:        None
+ * Overview:        Sends responses to NetBIOS name requests
  *
  * Note:            None
  ********************************************************************/
@@ -115,7 +117,9 @@ void NBNSTask(void)
 			break;
 
 		case NBNS_OPEN_SOCKET:
-			MySocket = UDPOpen(NBNS_PORT, NULL, NBNS_PORT);
+			//MySocket = UDPOpen(NBNS_PORT, NULL, NBNS_PORT);
+			
+			MySocket = UDPOpenEx(0,UDP_OPEN_SERVER,NBNS_PORT,NBNS_PORT);
 			if(MySocket == INVALID_UDP_SOCKET)
 				break;
 
@@ -197,7 +201,7 @@ void NBNSTask(void)
 					UDPPut(AppConfig.MyIPAddr.v[3]);
 
 					// Change the destination address to the unicast address of the last received packet
-		        	memcpy((void*)&UDPSocketInfo[MySocket].remoteNode, (const void*)&remoteNode, sizeof(remoteNode));
+		        	memcpy((void*)&UDPSocketInfo[MySocket].remote.remoteNode, (const void*)&remoteNode, sizeof(remoteNode));
 					UDPFlush();				
 				}
 
@@ -209,6 +213,22 @@ void NBNSTask(void)
 	}
 }
 
+/*********************************************************************
+ * Function:        static void NBNSPutName (BYTE *String)
+ *
+ * PreCondition:    None
+ *
+ * Input:           String: The name to transmit
+ *
+ * Output:          None
+ *
+ * Side Effects:    None
+ *
+ * Overview:        Transmits the NetBIOS name across an open UDP
+ *                  socket.
+ *
+ * Note:            None
+ ********************************************************************/
 static void NBNSPutName(BYTE *String)
 {
 	BYTE i, j;
@@ -224,6 +244,23 @@ static void NBNSPutName(BYTE *String)
 	UDPPut(0x00);
 }
 
+/*********************************************************************
+ * Function:        static void NBNSGetName (BYTE *String)
+ *
+ * PreCondition:    None
+ *
+ * Input:           String: Pointer to an array into which
+ *                  a received NetBIOS name should be copied.
+ *
+ * Output:          None
+ *
+ * Side Effects:    None
+ *
+ * Overview:        Reads the NetBIOS name from a UDP socket and
+ *                  copies it into a user-specified buffer.
+ *
+ * Note:            None
+ ********************************************************************/
 static void NBNSGetName(BYTE *String)
 {
 	BYTE i, j, k;

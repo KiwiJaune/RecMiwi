@@ -1,14 +1,14 @@
 /*********************************************************************
  *
  *	File Transfer Protocol (FTP) Client
- *  Module for Microchip TCP/IP Stack
- *	 -Provides ability to remotely upload new MPFS image (web pages) 
+ *  	Module for Microchip TCP/IP Stack
+ *	 -Provides ability to remotely upload MPFS2 image (web pages) 
  *	  to external EEPROM or external Flash memory
  *	 -Reference: RFC 959
  *
  *********************************************************************
  * FileName:        FTP.c
- * Dependencies:    TCP, Tick, MPFS, FTPVerify() callback
+ * Dependencies:    TCP, Tick, MPFS2, FTPVerify() callback
  * Processor:       PIC18, PIC24F, PIC24H, dsPIC30F, dsPIC33F, PIC32
  * Compiler:        Microchip C32 v1.05 or higher
  *					Microchip C30 v3.12 or higher
@@ -47,14 +47,14 @@
  * SIMILAR COSTS, WHETHER ASSERTED ON THE BASIS OF CONTRACT, TORT
  * (INCLUDING NEGLIGENCE), BREACH OF WARRANTY, OR OTHERWISE.
  *
- *
- * Author               Date    Comment
- *~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- * Nilesh Rajbharti     4/23/01  Original        (Rev 1.0)
- * Nilesh Rajbharti     11/13/02 Fixed FTPServer()
- * Howard Schlunder		07/10/06 Added hash printing to FTP client
- * Howard Schlunder		07/20/06 Added FTP_RESP_DATA_NO_SOCKET error message
- * Elliott Wood			07/31/07 Minor updates for compatibility
+ ********************************************************************
+ File Description:
+
+ Change History:
+  Rev   Description
+  ----  -----------------------------------------
+  5.36  FTP with MPFS2 and HTTP2
+ 
   ********************************************************************/
 #define __FTP_C
 
@@ -184,10 +184,11 @@ static BYTE             FTPString[MAX_FTP_CMD_STRING_LEN+2];
 static BYTE             FTPStringLen;
 static BYTE             *FTP_argv[MAX_FTP_ARGS];    // Parameters for a ftp command
 static BYTE             FTP_argc;       // Total number of params for a ftp command
-static TICK             lastActivity;   // Timeout keeper.
+static DWORD            lastActivity;   // Timeout keeper.
 
 
-static MPFS             FTPFileHandle;
+static MPFS_HANDLE      FTPFileHandle;
+
 
 // Private helper functions.
 static void ParseFTPString(void);
@@ -258,7 +259,7 @@ void FTPInit(void)
 BOOL FTPServer(void)
 {
     BYTE v;
-    TICK currentTick;
+    DWORD currentTick;
 
     if ( !TCPIsConnected(FTPSocket) )
     {
@@ -299,7 +300,7 @@ BOOL FTPServer(void)
     else if ( smFTP != SM_FTP_NOT_CONNECTED )
     {
         currentTick = TickGet();
-        currentTick = TickGetDiff(currentTick, lastActivity);
+        currentTick = currentTick - lastActivity;
         if ( currentTick >= FTP_TIMEOUT )
         {
             lastActivity                = TickGet();
@@ -347,12 +348,21 @@ SM_FTP_RESPOND_Label:
             }
         }
         break;
-
+	case SM_FTP_USER_NAME:
+	case SM_FTP_USER_PASS:
+		break;
 
     }
 
     return TRUE;
 }
+
+#ifdef WIFI_NET_TEST
+static BOOL FTPVerify(BYTE *login, BYTE *password)
+{
+	return TRUE;
+}
+#endif
 
 static BOOL ExecuteFTPCommand(FTP_COMMAND cmd)
 {
@@ -424,13 +434,13 @@ static BOOL Quit(void)
     case SM_FTP_CMD_IDLE:
 #if defined(FTP_PUT_ENABLED)
         if ( smFTPCommand == SM_FTP_CMD_RECEIVE )
-            MPFSClose();
+            MPFSClose(FTPFileHandle);
 #endif
 
         if ( FTPDataSocket != INVALID_SOCKET )
         {
 #if defined(FTP_PUT_ENABLED)
-            MPFSClose();
+            MPFSClose(FTPFileHandle);
 #endif
             TCPDisconnect(FTPDataSocket);
             smFTPCommand = SM_FTP_CMD_WAIT;
@@ -455,6 +465,8 @@ Quit_Done:
                 TCPDisconnect(FTPSocket);
         }
         break;
+	case SM_FTP_CMD_RECEIVE:
+		break;
 
     }
     return FALSE;
@@ -507,26 +519,27 @@ static BOOL PutFile(void)
         {
             // Reload timeout timer.
             lastActivity    = TickGet();
-            MPFSPutBegin(FTPFileHandle);
             while( TCPGet(FTPDataSocket, &v) )
             {
 #if defined(FTP_PUT_ENABLED)
-                MPFSPut(v);
+                MPFSPutArray(FTPFileHandle,&v,1);
 #endif
             }
-            FTPFileHandle = MPFSPutEnd();
+            MPFSPutEnd(TRUE);
 
         }
         else if ( !TCPIsConnected(FTPDataSocket) )
         {
 #if defined(FTP_PUT_ENABLED)
-            MPFSClose();
+            MPFSClose(FTPFileHandle);
 #endif
             TCPDisconnect(FTPDataSocket);
             FTPDataSocket   = INVALID_SOCKET;
             FTPResponse     = FTP_RESP_DATA_CLOSE;
             return TRUE;
         }
+	case SM_FTP_CMD_WAIT_FOR_DISCONNECT:
+		break;
     }
     return FALSE;
 }

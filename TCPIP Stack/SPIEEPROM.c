@@ -82,12 +82,12 @@
 #define EEPROM_PAGE_SIZE				(64)
 
 // EEPROM SPI opcodes
-#define READ    0x03    // Read data from memory array beginning at selected address
-#define WRITE   0x02    // Write data to memory array beginning at selected address
-#define WRDI    0x04    // Reset the write enable latch (disable write operations)
-#define WREN    0x06    // Set the write enable latch (enable write operations)
-#define RDSR    0x05    // Read Status register
-#define WRSR    0x01    // Write Status register
+#define OPCODE_READ    0x03    // Read data from memory array beginning at selected address
+#define OPCODE_WRITE   0x02    // Write data to memory array beginning at selected address
+#define OPCODE_WRDI    0x04    // Reset the write enable latch (disable write operations)
+#define OPCODE_WREN    0x06    // Set the write enable latch (enable write operations)
+#define OPCODE_RDSR    0x05    // Read Status register
+#define OPCODE_WRSR    0x01    // Write Status register
 
 #define EEPROM_MAX_SPI_FREQ     (10000000ul)    // Hz
 
@@ -139,14 +139,14 @@ static BYTE vBytesInBuffer;
  ********************************************************************/
 #if (defined(HPC_EXPLORER) || defined(PIC18_EXPLORER)) && !defined(__18F87J10) && !defined(__18F87J11) && !defined(__18F87J50)
     #define PROPER_SPICON1  (0x20)      /* SSPEN bit is set, SPI in master mode, FOSC/4, IDLE state is low level */
-#elif defined(__PIC24F__)
+#elif defined(__PIC24F__) || defined(__PIC24FK__)
     #define PROPER_SPICON1  (0x0013 | 0x0120)   /* 1:1 primary prescale, 4:1 secondary prescale, CKE=1, MASTER mode */
 #elif defined(__dsPIC30F__)
     #define PROPER_SPICON1  (0x0017 | 0x0120)   /* 1:1 primary prescale, 3:1 secondary prescale, CKE=1, MASTER mode */
-#elif defined(__dsPIC33F__) || defined(__PIC24H__)
+#elif defined(__dsPIC33F__) || defined(__PIC24H__) || defined (__dsPIC33E__)|| defined(__PIC24E__)
     #define PROPER_SPICON1  (0x0003 | 0x0120)   /* 1:1 primary prescale, 8:1 secondary prescale, CKE=1, MASTER mode */
 #elif defined(__PIC32MX__)
-    #define PROPER_SPICON1  (_SPI2CON_ON_MASK | _SPI2CON_FRZ_MASK | _SPI2CON_CKE_MASK | _SPI2CON_MSTEN_MASK)
+    #define PROPER_SPICON1  (_SPI2CON_ON_MASK | _SPI2CON_CKE_MASK | _SPI2CON_MSTEN_MASK)
 #else
     #define PROPER_SPICON1  (0x21)      /* SSPEN bit is set, SPI in master mode, FOSC/16, IDLE state is low level */
 #endif
@@ -257,7 +257,7 @@ XEE_RESULT XEEEndRead(void)
 /*********************************************************************
  * Function:        XEE_RESULT XEEReadArray(DWORD address,
  *                                          BYTE *buffer,
- *                                          BYTE length)
+ *                                          WORD length)
  *
  * PreCondition:    XEEInit() is already called.
  *
@@ -277,7 +277,7 @@ XEE_RESULT XEEEndRead(void)
  ********************************************************************/
 XEE_RESULT XEEReadArray(DWORD address,
                         BYTE *buffer,
-                        BYTE length)
+                        WORD length)
 {
     volatile BYTE Dummy;
     BYTE vSPIONSave;
@@ -301,7 +301,7 @@ XEE_RESULT XEEReadArray(DWORD address,
     EEPROM_CS_IO = 0;
 
     // Send READ opcode
-    EEPROM_SSPBUF = READ;
+    EEPROM_SSPBUF = OPCODE_READ;
     WaitForDataByte();
     Dummy = EEPROM_SSPBUF;
 
@@ -484,14 +484,14 @@ static void DoWrite(void)
 
     // Set the Write Enable latch
     EEPROM_CS_IO = 0;
-    EEPROM_SSPBUF = WREN;
+    EEPROM_SSPBUF = OPCODE_WREN;
     WaitForDataByte();
     vDummy = EEPROM_SSPBUF;
     EEPROM_CS_IO = 1;
 
     // Send WRITE opcode
     EEPROM_CS_IO = 0;
-    EEPROM_SSPBUF = WRITE;
+    EEPROM_SSPBUF = OPCODE_WRITE;
     WaitForDataByte();
     vDummy = EEPROM_SSPBUF;
 
@@ -576,7 +576,7 @@ BOOL XEEIsBusy(void)
 
     EEPROM_CS_IO = 0;
     // Send RDSR - Read Status Register opcode
-    EEPROM_SSPBUF = RDSR;
+    EEPROM_SSPBUF = OPCODE_RDSR;
     WaitForDataByte();
     result.Val = EEPROM_SSPBUF;
 

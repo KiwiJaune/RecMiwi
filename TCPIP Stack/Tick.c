@@ -7,7 +7,7 @@
  * Dependencies:    Timer 0 (PIC18) or Timer 1 (PIC24F, PIC24H, 
  *					dsPIC30F, dsPIC33F, PIC32)
  * Processor:       PIC18, PIC24F, PIC24H, dsPIC30F, dsPIC33F, PIC32
- * Compiler:        Microchip C32 v1.05 or higher
+ * Compiler:        Microchip C32 v1.10b or higher
  *					Microchip C30 v3.12 or higher
  *					Microchip C18 v3.30 or higher
  *					HI-TECH PICC-18 PRO 9.63PL2 or higher
@@ -15,7 +15,7 @@
  *
  * Software License Agreement
  *
- * Copyright (C) 2002-2009 Microchip Technology Inc.  All rights
+ * Copyright (C) 2002-2010 Microchip Technology Inc.  All rights
  * reserved.
  *
  * Microchip licenses to you the right to use, modify, copy, and
@@ -93,6 +93,21 @@ static void GetTickCopy(void);
   ***************************************************************************/
 void TickInit(void)
 {
+#if defined(__18CXX)
+	// Use Timer0 for 8 bit processors
+    // Initialize the time
+    TMR0H = 0;
+    TMR0L = 0;
+
+	// Set up the timer interrupt
+	INTCON2bits.TMR0IP = 0;		// Low priority
+    INTCONbits.TMR0IF = 0;
+    INTCONbits.TMR0IE = 1;		// Enable interrupt
+
+    // Timer0 on, 16-bit, internal timer, 1:256 prescalar
+    T0CON = 0x87;
+
+#else
 	// Use Timer 1 for 16-bit and 32-bit processors
 	// 1:256 prescale
 	T1CONbits.TCKPS = 3;
@@ -105,15 +120,16 @@ void TickInit(void)
 	#if defined(__C30__)
 		IPC0bits.T1IP = 2;	// Interrupt priority 2 (low)
 		IFS0bits.T1IF = 0;
+		IEC0bits.T1IE = 1;
 	#else
 		IPC1bits.T1IP = 2;	// Interrupt priority 2 (low)
 		IFS0CLR = _IFS0_T1IF_MASK;
+		IEC0SET = _IEC0_T1IE_MASK;
 	#endif
-	IEC0bits.T1IE = 1;
 
 	// Start timer
 	T1CONbits.TON = 1;
-
+#endif
 }
 
 /*****************************************************************************
@@ -151,7 +167,7 @@ static void GetTickCopy(void)
 		*((DWORD*)&vTickReading[2]) = dwInternalTicks;
 	} while(INTCONbits.TMR0IF);
 	INTCONbits.TMR0IE = 1;			// Enable interrupt
-#else
+#elif defined(__C30__)
 	do
 	{
 		DWORD dwTempTicks;
@@ -159,7 +175,7 @@ static void GetTickCopy(void)
 		IEC0bits.T1IE = 1;			// Enable interrupt
 		Nop();
 		IEC0bits.T1IE = 0;			// Disable interrupt
-		
+
 		// Get low 2 bytes
 		((WORD*)vTickReading)[0] = TMR1;
 		
@@ -176,6 +192,42 @@ static void GetTickCopy(void)
 		vTickReading[5] = ((BYTE*)&dwTempTicks)[3];
 	} while(IFS0bits.T1IF);
 	IEC0bits.T1IE = 1;				// Enable interrupt
+#else	// PIC32
+	do
+	{
+		DWORD dwTempTicks;
+		
+		IEC0SET = _IEC0_T1IE_MASK;	// Enable interrupt
+		Nop();
+		IEC0CLR = _IEC0_T1IE_MASK;	// Disable interrupt
+		
+		// Get low 2 bytes
+		((volatile WORD*)vTickReading)[0] = TMR1;
+		
+		// Correct corner case where interrupt increments byte[4+] but 
+		// TMR1 hasn't rolled over to 0x0000 yet
+		dwTempTicks = dwInternalTicks;
+
+		// PIC32MX3XX/4XX devices trigger the timer interrupt when TMR1 == PR1 
+		// (TMR1 prescalar is 0x00), requiring us to undo the ISR's increment 
+		// of the upper 32 bits of our 48 bit timer in the special case when 
+		// TMR1 == PR1 == 0xFFFF.  For other PIC32 families, the ISR is 
+		// triggered when TMR1 increments from PR1 to 0x0000, making no special 
+		// corner case.
+		#if __PIC32_FEATURE_SET__ <= 460
+			if(((WORD*)vTickReading)[0] == 0xFFFFu)
+				dwTempTicks--;
+		#elif !defined(__PIC32_FEATURE_SET__)
+			#error __PIC32_FEATURE_SET__ macro must be defined.  You need to download a newer C32 compiler version.
+		#endif
+		
+		// Get high 4 bytes
+		vTickReading[2] = ((BYTE*)&dwTempTicks)[0];
+		vTickReading[3] = ((BYTE*)&dwTempTicks)[1];
+		vTickReading[4] = ((BYTE*)&dwTempTicks)[2];
+		vTickReading[5] = ((BYTE*)&dwTempTicks)[3];
+	} while(IFS0bits.T1IF);
+	IEC0SET = _IEC0_T1IE_MASK;		// Enable interrupt
 #endif
 }
 
@@ -236,15 +288,15 @@ DWORD TickGet(void)
   ***************************************************************************/
 DWORD TickGetDiv256(void)
 {
-	DWORD_VAL ret;
+	DWORD dw;
 
 	GetTickCopy();
-	ret.v[0] = vTickReading[1];	// Note: This copy must be done one 
-	ret.v[1] = vTickReading[2];	// byte at a time to prevent misaligned 
-	ret.v[2] = vTickReading[3];	// memory reads, which will reset the PIC.
-	ret.v[3] = vTickReading[4];
+	((BYTE*)&dw)[0] = vTickReading[1];	// Note: This copy must be done one 
+	((BYTE*)&dw)[1] = vTickReading[2];	// byte at a time to prevent misaligned 
+	((BYTE*)&dw)[2] = vTickReading[3];	// memory reads, which will reset the PIC.
+	((BYTE*)&dw)[3] = vTickReading[4];
 	
-	return ret.Val;
+	return dw;
 }
 
 /*****************************************************************************
@@ -273,15 +325,15 @@ DWORD TickGetDiv256(void)
   ***************************************************************************/
 DWORD TickGetDiv64K(void)
 {
-	DWORD_VAL ret;
+	DWORD dw;
 
 	GetTickCopy();
-	ret.v[0] = vTickReading[2];	// Note: This copy must be done one 
-	ret.v[1] = vTickReading[3];	// byte at a time to prevent misaligned 
-	ret.v[2] = vTickReading[4];	// memory reads, which will reset the PIC.
-	ret.v[3] = vTickReading[5];
+	((BYTE*)&dw)[0] = vTickReading[2];	// Note: This copy must be done one 
+	((BYTE*)&dw)[1] = vTickReading[3];	// byte at a time to prevent misaligned 
+	((BYTE*)&dw)[2] = vTickReading[4];	// memory reads, which will reset the PIC.
+	((BYTE*)&dw)[3] = vTickReading[5];
 	
-	return ret.Val;
+	return dw;
 }
 
 

@@ -19,7 +19,7 @@
  *
  * Software License Agreement
  *
- * Copyright (C) 2002-2009 Microchip Technology Inc.  All rights
+ * Copyright (C) 2002-2010 Microchip Technology Inc.  All rights
  * reserved.
  *
  * Microchip licenses to you the right to use, modify, copy, and
@@ -48,9 +48,12 @@
  * SIMILAR COSTS, WHETHER ASSERTED ON THE BASIS OF CONTRACT, TORT
  * (INCLUDING NEGLIGENCE), BREACH OF WARRANTY, OR OTHERWISE.
  *
- * Author               Date    Comment
+ * Author               Date    	Comment
  *~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- * Nilesh Rajbharti     8/5/03  Original        (Rev 1.0)
+ * Nilesh Rajbharti     8/5/03  	Original        (Rev 1.0)
+ * Howard Schlunder		01/05/2010	Added TFTPUploadRAMFileToHost(), 
+ 									TFTPUploadFragmentedRAMFileToHost(), 
+ 									and TFTPGetUploadStatus() APIs.
  ********************************************************************/
 #define __TFTPC_C
 
@@ -60,14 +63,17 @@
 
 #include "TCPIP Stack/TCPIP.h"
 
-
-#define TFTP_CLIENT_PORT        65352L       // Some unique port on this
-                                            // device.
+// The TFTP Client port - a unique port on this device
+#define TFTP_CLIENT_PORT        65352L       
+// The TFTP Server Port
 #define TFTP_SERVER_PORT        (69L)
-#define TFTP_BLOCK_SIZE         (0x200L)     // 512 bytes
+// The size of a TFTP block - 512 bytes
+#define TFTP_BLOCK_SIZE         (0x200L)
+// The MSB of the TFTP_BLOCK_SIZE
 #define TFTP_BLOCK_SIZE_MSB     (0x02u)
 
-typedef enum _TFTP_STATE
+// The TFTP state machine
+typedef enum
 {
     SM_TFTP_WAIT = 0,
     SM_TFTP_READY,
@@ -78,7 +84,8 @@ typedef enum _TFTP_STATE
     SM_TFTP_SEND_LAST_ACK
 } TFTP_STATE;
 
-typedef enum _TFTP_OPCODE
+// Enumeration of TFTP opcodes
+typedef enum
 {
     TFTP_OPCODE_RRQ = 1,        // Get
     TFTP_OPCODE_WRQ,            // Put
@@ -88,11 +95,10 @@ typedef enum _TFTP_OPCODE
 } TFTP_OPCODE;
 
 
+UDP_SOCKET _tftpSocket = TFTP_UPLOAD_COMPLETE;         // TFTP Socket for TFTP server link
+WORD _tftpError;                // Variable to preserve error condition causes for later transmission
 
-UDP_SOCKET _tftpSocket;         // TFTP Socket for TFTP server link
-WORD _tftpError;
-
-static union _MutExVar
+static union
 {
     struct
     {
@@ -107,10 +113,14 @@ static union _MutExVar
     } group2;
 } MutExVar;     // Mutually Exclusive variable groups to conserve RAM.
 
-
+// TFTP state machine tracker variable
 static TFTP_STATE _tftpState;
+// Tracker variable for the number of TFTP retries
 static BYTE _tftpRetries;
-static TICK _tftpStartTick;
+// Timing variable used to detect timeout conditions
+static DWORD _tftpStartTick;
+
+// TFTP status flags
 static union
 {
     struct
@@ -125,11 +135,13 @@ static union
 } _tftpFlags;
 
 
-// Private helper functions
+// Private helper function
 static void _TFTPSendFileName(TFTP_OPCODE command, BYTE *fileName);
+// Private helper function
 static void _TFTPSendAck(WORD_VAL blockNumber);
 
 #if defined(__18CXX)
+    // PIC18 ROM variable argument implementation of _TFTPSendFileName
 	static void _TFTPSendROMFileName(TFTP_OPCODE opcode, ROM BYTE *fileName);
 #endif
 
@@ -140,9 +152,348 @@ static void _TFTPSendAck(WORD_VAL blockNumber);
     #define DEBUG(a)
 #endif
 
+// TFTPUploadRAMFileToHost(), TFTPUploadFragmentedRAMFileToHost() and 
+// TFTPGetUploadStatus() functions require the DNS client module to be enabled 
+// for them to work.  The RAM and ROM resources for these functions can be 
+// preserved if the DNS client module isn't enabled.
+#if defined(STACK_USE_DNS)
+
+static ROM BYTE *vUploadRemoteHost;
+static ROM BYTE *vUploadFilename;
+static TFTP_CHUNK_DESCRIPTOR *uploadChunkDescriptor;
+static WORD wUploadChunkOffset;
+static CHAR smUpload = TFTP_UPLOAD_COMPLETE;
+static TFTP_CHUNK_DESCRIPTOR *uploadChunkDescriptorForRetransmit;
+static WORD wUploadChunkOffsetForRetransmit;
+
+/*****************************************************************************
+  Function:
+	void TFTPUploadRAMFileToHost(ROM BYTE *vRemoteHost, 
+								 ROM BYTE *vFilename, 
+								 BYTE *vData, 
+								 WORD wDataLength)
+
+  Summary:
+	Uploads a contiguous array of RAM bytes as a file to a remote TFTP server.
+	
+  Description:
+	Uploads a contiguous array of RAM bytes as a file to a remote TFTP server.
+	
+  Precondition:
+	None
+
+  Parameters:
+	vRemoteHost: ROM string of the remote TFTP server to upload to (ex: 
+		"www.myserver.com").  For device architectures that make no distinction 
+		between RAM and ROM pointers (PIC24, dsPIC and PIC32), this string must 
+		remain allocated and unmodified in RAM until the TFTP upload process 
+		completes (as indicated by TFTPGetUploadStatus()).  
+	vFilename: ROM string of the remote file to create/overwrite (ex: 
+		"status.txt").  For device architectures that make no distinction 
+		between RAM and ROM pointers (PIC24, dsPIC and PIC32), this string must 
+		remain allocated and unmodified in RAM until the TFTP upload process 
+		completes (as indicated by TFTPGetUploadStatus()).
+	vData: Pointer to a RAM array of data to write to the file.
+	wDataLength: Number of bytes pointed to by vData.  This will be the final 
+		file size of the uploaded file.  Note that since this is defined as a 
+		WORD type, the maximum possible file size is 65535 bytes.  For longer 
+		files, call the TFTPUploadFragmentedRAMFileToHost() function instead.
+
+  Returns:
+  	None
+  
+  Remarks:
+	The DNS client module must be enabled to use this function.  i.e. 
+	STACK_USE_DNS must be defined in TCPIPConfig.h.
+
+  	Call the TFTPGetUploadStatus() function to determine the status of the file 
+  	upload.
+  	
+  	It is only possible to have one TFTP operation active at any given time.  
+  	After starting a TFTP operation by calling TFTPUploadRAMFileToHost() or 
+  	TFTPUploadFragmentedRAMFileToHost(), you must wait until 
+  	TFTPGetUploadStatus() returns a completion status code (<=0) before calling 
+  	any other TFTP API functions.
+  ***************************************************************************/
+void TFTPUploadRAMFileToHost(ROM BYTE *vRemoteHost, ROM BYTE *vFilename, BYTE *vData, WORD wDataLength)
+{
+	static TFTP_CHUNK_DESCRIPTOR chunk[2];
+	chunk[0].vDataPointer = vData;
+	chunk[0].wDataLength = wDataLength;
+	chunk[1].vDataPointer = NULL;
+	TFTPUploadFragmentedRAMFileToHost(vRemoteHost, vFilename, chunk);
+}
+
+/*****************************************************************************
+  Function:
+	void TFTPUploadFragmentedRAMFileToHost(ROM BYTE *vRemoteHost, 
+										   ROM BYTE *vFilename, 
+										   TFTP_CHUNK_DESCRIPTOR *vFirstChunkDescriptor)
+  Summary:
+	Uploads an random, potentially non-contiguous, array of RAM bytes as a file 
+	to a remote TFTP server.
+	
+  Description:
+	Uploads an random, potentially non-contiguous, array of RAM bytes as a file 
+	to a remote TFTP server.
+	
+  Precondition:
+	None
+
+  Parameters:
+	vRemoteHost: ROM string of the remote TFTP server to upload to (ex: 
+		"www.myserver.com").  For device architectures that make no distinction 
+		between RAM and ROM pointers (PIC24, dsPIC and PIC32), this string must 
+		remain allocated and unmodified in RAM until the TFTP upload process 
+		completes (as indicated by TFTPGetUploadStatus()).  
+	vFilename: ROM string of the remote file to create/overwrite (ex: 
+		"status.txt").  For device architectures that make no distinction 
+		between RAM and ROM pointers (PIC24, dsPIC and PIC32), this string must 
+		remain allocated and unmodified in RAM until the TFTP upload process 
+		completes (as indicated by TFTPGetUploadStatus()).
+	vFirstChunkDescriptor: Pointer to a static or global (persistent) array of 
+		TFTP_CHUNK_DESCRIPTOR structures describing what RAM memory addresses 
+		the file contents should be obtained from.  The 
+		TFTP_CHUNK_DESCRIPTOR.vDataPointer field should be set to the memory 
+		address of the data to transmit, and the 
+		TFTP_CHUNK_DESCRIPTOR.wDataLength field should be set to the number of 
+		bytes to transmit from the given pointer.  The TFTP_CHUNK_DESCRIPTOR 
+		array must be terminated by a dummy descriptor whos 
+		TFTP_CHUNK_DESCRIPTOR.vDataPointer pointer is set to NULL.  Refer to the 
+		TFTPUploadRAMFileToHost() API for an example calling sequence since it 
+		merely a wrapper to this TFTPUploadFragmentedRAMFileToHost() function.
+
+  Returns:
+  	None
+  
+  Remarks:
+	The DNS client module must be enabled to use this function.  i.e. 
+	STACK_USE_DNS must be defined in TCPIPConfig.h.
+
+  	Call the TFTPGetUploadStatus() function to determine the status of the file 
+  	upload.
+  	
+  	It is only possible to have one TFTP operation active at any given time.  
+  	After starting a TFTP operation by calling TFTPUploadRAMFileToHost() or 
+  	TFTPUploadFragmentedRAMFileToHost(), you must wait until 
+  	TFTPGetUploadStatus() returns a completion status code (<=0) before calling 
+  	any other TFTP API functions.
+  ***************************************************************************/
+void TFTPUploadFragmentedRAMFileToHost(ROM BYTE *vRemoteHost, ROM BYTE *vFilename, TFTP_CHUNK_DESCRIPTOR *vFirstChunkDescriptor)
+{
+	vUploadRemoteHost = vRemoteHost;
+	vUploadFilename = vFilename;
+	uploadChunkDescriptor = vFirstChunkDescriptor;
+	uploadChunkDescriptorForRetransmit = vFirstChunkDescriptor;
+	wUploadChunkOffset = 0;
+	wUploadChunkOffsetForRetransmit = 0;
+	if(smUpload == TFTP_UPLOAD_RESOLVE_HOST)
+		DNSEndUsage();
+	smUpload = TFTP_UPLOAD_GET_DNS;
+}
+
+
+/*****************************************************************************
+  Function:
+	CHAR TFTPGetUploadStatus(void)
+	
+  Summary:
+	Returns the TFTP file upload status started by calling the 
+	TFTPUploadRAMFileToHost() or TFTPUploadFragmentedRAMFileToHost() functions.
+	
+  Description:
+	Returns the TFTP file upload status started by calling the 
+	TFTPUploadRAMFileToHost() or TFTPUploadFragmentedRAMFileToHost() functions.
+	
+  Precondition:
+	None
+
+  Parameters:
+	None
+
+  Returns:
+  	A status code.  Negative results are fatal errors.  Positive results 
+  	indicate the TFTP upload operation is still being processed.  A zero result 
+  	indicates successful file upload completion (TFTP API is now idle and 
+  	available for further calls).  Specific return values are as follows:
+  	0 (TFTP_UPLOAD_COMPLETE): Upload completed successfully
+  	1 (TFTP_UPLOAD_GET_DNS): Attempting to obtain DNS client module
+  	2 (TFTP_UPLOAD_RESOLVE_HOST): Attempting to resolve TFTP hostname
+  	3 (TFTP_UPLOAD_CONNECT): Attempting to ARP and contact the TFTP server
+  	4 (TFTP_UPLOAD_SEND_FILENAME): Attempting to send the filename and receive 
+  		acknowledgement.
+  	5 (TFTP_UPLOAD_SEND_DATA): Attempting to send the file contents and receive 
+  		acknowledgement.
+  	6 (TFTP_UPLOAD_WAIT_FOR_CLOSURE): Attempting to send the final packet of 
+  		file contents and receive acknowledgement.
+  	-1 (TFTP_UPLOAD_HOST_RESOLVE_TIMEOUT): Couldn't resolve hostname
+  	-2 (TFTP_UPLOAD_CONNECT_TIMEOUT): Couldn't finish ARP and reach server
+  	-3 (TFTP_UPLOAD_SERVER_ERROR): TFTP server returned an error (ex: access 
+  		denial) or file upload failed due to a timeout (partial file may have 
+  		been uploaded).
+  
+  Remarks:
+	The DNS client module must be enabled to use this function.  i.e. 
+	STACK_USE_DNS must be defined in TCPIPConfig.h.
+  ***************************************************************************/
+CHAR TFTPGetUploadStatus(void)
+{
+	TFTP_RESULT result;
+	IP_ADDR ipRemote;
+	WORD w, w2;
+	BYTE *vData;
+
+	if(UDPIsOpened(_tftpSocket)== FALSE)
+	{
+
+		_tftpSocket = UDPOpenEx((DWORD)(ROM_PTR_BASE)vUploadRemoteHost,
+										 UDP_OPEN_ROM_HOST,TFTP_CLIENT_PORT,
+										 TFTP_SERVER_PORT);
+	}
+
+	switch(smUpload)
+	{
+	case TFTP_UPLOAD_GET_DNS:
+		if(!DNSBeginUsage())
+			break;
+		DNSResolveROM(vUploadRemoteHost, DNS_TYPE_A);
+		smUpload = TFTP_UPLOAD_RESOLVE_HOST;
+		break;
+
+	case TFTP_UPLOAD_RESOLVE_HOST:
+		if(!DNSIsResolved(&ipRemote))
+			break;
+		DNSEndUsage();
+		if(ipRemote.Val == 0u)
+		{
+			smUpload = TFTP_UPLOAD_HOST_RESOLVE_TIMEOUT;
+			break;
+		}
+		TFTPOpen(&ipRemote);
+		smUpload = TFTP_UPLOAD_CONNECT;
+		break;
+	case TFTP_UPLOAD_CONNECT:
+		switch(TFTPIsOpened())
+		{
+		case TFTP_OK:
+			TFTPOpenROMFile(vUploadFilename, TFTP_FILE_MODE_WRITE);
+			smUpload = TFTP_UPLOAD_SEND_FILENAME;
+			break;
+		case TFTP_TIMEOUT:
+			smUpload = TFTP_UPLOAD_CONNECT_TIMEOUT;
+			break;
+		default:
+			break;
+		}
+		break;
+
+	case TFTP_UPLOAD_SEND_FILENAME:
+		result = TFTPIsFileOpened();
+		switch(result)
+		{
+		case TFTP_OK:
+			smUpload = TFTP_UPLOAD_SEND_DATA;
+			break;
+		case TFTP_RETRY:
+			TFTPOpenROMFile(vUploadFilename, TFTP_FILE_MODE_WRITE);
+			break;
+		case TFTP_TIMEOUT:
+			smUpload = TFTP_UPLOAD_CONNECT_TIMEOUT;
+			break;
+		case TFTP_ERROR:
+			smUpload = TFTP_UPLOAD_SERVER_ERROR;
+			break;
+		default:
+			break;
+		}
+		if(result != TFTP_OK)
+			break;
+		// No break when TFTPIsFileOpened() returns TFTP_OK -- we need to immediately start sending data
+
+	case TFTP_UPLOAD_SEND_DATA:
+		switch(TFTPIsPutReady())
+		{
+		case TFTP_OK:
+			// Write blocksize bytes of data
+			uploadChunkDescriptorForRetransmit = uploadChunkDescriptor;
+			wUploadChunkOffsetForRetransmit = wUploadChunkOffset;
+			vData = uploadChunkDescriptor->vDataPointer + wUploadChunkOffset;
+			w = TFTP_BLOCK_SIZE;
+			while(w)
+			{
+				w2 = uploadChunkDescriptor->wDataLength - wUploadChunkOffset;
+				if(w2 > w)
+					w2 = w;
+				w -= w2;
+				wUploadChunkOffset += w2;
+				if(vData == NULL)
+				{
+					TFTPCloseFile();
+					smUpload = TFTP_UPLOAD_WAIT_FOR_CLOSURE;
+					break;
+				}
+				while(w2--)
+				{
+					TFTPPut(*vData++);
+				}
+				if(wUploadChunkOffset == uploadChunkDescriptor->wDataLength)
+				{
+					uploadChunkDescriptor++;
+					wUploadChunkOffset = 0;
+					vData = uploadChunkDescriptor->vDataPointer;
+				}
+			}
+			break;
+
+		case TFTP_RETRY:
+			uploadChunkDescriptor = uploadChunkDescriptorForRetransmit;
+			wUploadChunkOffset = wUploadChunkOffsetForRetransmit;
+			break;
+
+		case TFTP_TIMEOUT:
+		case TFTP_ERROR:
+			smUpload = TFTP_UPLOAD_SERVER_ERROR;
+			break;
+
+		default:
+			break;
+		}
+		break;
+
+	case TFTP_UPLOAD_WAIT_FOR_CLOSURE:
+		switch(TFTPIsFileClosed())
+		{
+		case TFTP_OK:
+			smUpload = TFTP_UPLOAD_COMPLETE;
+			UDPClose(_tftpSocket);
+			break;
+		case TFTP_RETRY:
+			uploadChunkDescriptor = uploadChunkDescriptorForRetransmit;
+			wUploadChunkOffset = wUploadChunkOffsetForRetransmit;
+			smUpload = TFTP_UPLOAD_SEND_DATA;
+			break;
+		case TFTP_TIMEOUT:
+		case TFTP_ERROR:
+			smUpload = TFTP_UPLOAD_SERVER_ERROR;
+			break;
+		default:
+			break;
+		}
+		break;
+
+	default:
+		break;
+	}
+	
+	return smUpload;
+}
+#endif
+
 
 /*********************************************************************
  * Function:        void TFTPOpen(IP_ADDR *host)
+ *
+ * Summary:         Initializes TFTP module.
  *
  * PreCondition:    UDP module is already initialized
  *                  and at least one UDP socket is available.
@@ -168,7 +519,7 @@ void TFTPOpen(IP_ADDR *host)
     MutExVar.group1._hostInfo.IPAddr.Val = host->Val;
 
     // Initiate ARP resolution.
-    ARPResolve(&MutExVar.group1._hostInfo.IPAddr);
+   // ARPResolve(&MutExVar.group1._hostInfo.IPAddr);
 
     // Wait for ARP to get resolved.
     _tftpState = SM_TFTP_WAIT;
@@ -185,6 +536,8 @@ void TFTPOpen(IP_ADDR *host)
 
 /*********************************************************************
  * Function:        TFTP_RESULT TFTPIsOpened(void)
+ *
+ * Summary:         Determines if the TFTP connection is open.
  *
  * PreCondition:    TFTPOpen() is already called.
  *
@@ -214,19 +567,22 @@ TFTP_RESULT TFTPIsOpened(void)
     switch(_tftpState)
     {
     default:
+		_tftpState = SM_TFTP_READY;
+#if 0
         DEBUG(printf("Resolving remote IP...\n"));
 
         // Check to see if adddress is resolved.
         if ( ARPIsResolved(&MutExVar.group1._hostInfo.IPAddr,
                            &MutExVar.group1._hostInfo.MACAddr) )
         {
-            _tftpSocket = UDPOpen(TFTP_CLIENT_PORT,
+            _tftpSocket = UDPOpenEx(TFTP_CLIENT_PORT,
                                   &MutExVar.group1._hostInfo,
                                   TFTP_SERVER_PORT);
             _tftpState = SM_TFTP_READY;
         }
         else
             break;
+#endif		
 
     case SM_TFTP_READY:
         // Wait for UDP to be ready.  Immediately after this user will
@@ -238,7 +594,7 @@ TFTP_RESULT TFTPIsOpened(void)
     }
 
     // Make sure that we do not do this forever.
-    if ( TickGetDiff(TickGet(), _tftpStartTick) >= TFTP_ARP_TIMEOUT_VAL )
+    if ( TickGet() - _tftpStartTick >= TFTP_ARP_TIMEOUT_VAL )
     {
         _tftpStartTick = TickGet();
 
@@ -256,6 +612,8 @@ TFTP_RESULT TFTPIsOpened(void)
 /*********************************************************************
  * Function:        void TFTPOpenFile(char *fileName,
  *                                    TFTP_FILE_MODE mode)
+ *
+ * Summary:         Prepares and sends TFTP file name and mode packet.
  *
  * PreCondition:    TFPTIsFileOpenReady() = TRUE
  *
@@ -286,6 +644,7 @@ void TFTPOpenFile(BYTE *fileName, TFTP_FILE_MODE mode)
     // Most TFTP servers accept connection TFTP port. but once
     // connection is established, they use other temp. port,
     UDPSocketInfo[_tftpSocket].remotePort = TFTP_SERVER_PORT;
+	memcpy(&UDPSocketInfo[_tftpSocket].remote.remoteHost, &MutExVar.group1._hostInfo.IPAddr.Val, sizeof(DWORD));
 
     // Tell remote server about our intention.
     _TFTPSendFileName(mode, fileName);
@@ -379,6 +738,8 @@ void TFTPOpenROMFile(ROM BYTE *fileName, TFTP_FILE_MODE mode)
 /*********************************************************************
  * Function:        TFTP_RESULT TFTPIsFileOpened(void)
  *
+ * Summary:         Determines if file has been opened.
+ *
  * PreCondition:    TFTPOpenFile() is called.
  *
  * Input:           None
@@ -390,7 +751,7 @@ void TFTPOpenROMFile(ROM BYTE *fileName, TFTP_FILE_MODE mode)
  *
  *                  TFTP_TIMEOUT if all attempts were exhausted.
  *
- *                  TFTP_NOT_ERROR if remote server responded with
+ *                  TFTP_ERROR if remote server responded with
  *                  error
  *
  *                  TFTP_NOT_READY if file is not yet opened.
@@ -420,6 +781,8 @@ TFTP_RESULT TFTPIsFileOpened(void)
 
 /*********************************************************************
  * Function:        TFTP_RESULT TFTPIsGetReady(void)
+ *
+ * Summary:         Determines if a data block is ready to be read.
  *
  * PreCondition:    TFTPOpenFile() is called with TFTP_FILE_MODE_READ
  *                  and TFTPIsFileOpened() returned with TRUE.
@@ -461,7 +824,7 @@ TFTP_RESULT TFTPIsGetReady(void)
 
     // Check to see if timeout has occurred.
     bTimeOut = FALSE;
-    if ( TickGetDiff(TickGet(), _tftpStartTick) >= TFTP_GET_TIMEOUT_VAL )
+    if ( TickGet() - _tftpStartTick >= TFTP_GET_TIMEOUT_VAL )
     {
         bTimeOut = TRUE;
         _tftpStartTick = TickGet();
@@ -610,6 +973,11 @@ TFTP_RESULT TFTPIsGetReady(void)
             _tftpState = SM_TFTP_WAIT_FOR_DATA;
         }
         break;
+
+	// Suppress compiler warnings on unhandled SM_TFTP_WAIT and 
+	// SM_TFTP_WAIT_FOR_ACK states.
+    default:	
+    	break;
     }
 
 
@@ -621,6 +989,8 @@ TFTP_RESULT TFTPIsGetReady(void)
 
 /*********************************************************************
  * Function:        BYTE TFTPGet(void)
+ *
+ * Summary:         Gets a data byte from data that was read.
  *
  * PreCondition:    TFTPOpenFile() is called with TFTP_FILE_MODE_READ
  *                  and TFTPIsGetReady() = TRUE
@@ -673,6 +1043,8 @@ BYTE TFTPGet(void)
 
 /*********************************************************************
  * Function:        void TFTPCloseFile(void)
+ *
+ * Summary:         Sends file closing messages.
  *
  * PreCondition:    TFTPOpenFile() was called and TFTPIsFileOpened()
  *                  had returned with TFTP_OK.
@@ -746,7 +1118,9 @@ void TFTPCloseFile(void)
 
 
 /*********************************************************************
- * Function:        TFTP_RESULT TFPTIsFileClosed(void)
+ * Function:        TFTP_RESULT TFTPIsFileClosed(void)
+ *
+ * Summary:         Determines if the file was closed.
  *
  * PreCondition:    TFTPCloseFile() is already called.
  *
@@ -795,6 +1169,8 @@ TFTP_RESULT TFTPIsFileClosed(void)
 /*********************************************************************
  * Function:        TFTP_RESULT TFTPIsPutReady(void)
  *
+ * Summary:         Determines if data can be written to a file.
+ *
  * PreCondition:    TFTPOpenFile() is called with TFTP_FILE_MODE_WRITE
  *                  and TFTPIsFileOpened() returned with TRUE.
  *
@@ -835,7 +1211,7 @@ TFTP_RESULT TFTPIsPutReady(void)
 
     // Check to see if timeout has occurred.
     bTimeOut = FALSE;
-    if ( TickGetDiff(TickGet(), _tftpStartTick) >= TFTP_GET_TIMEOUT_VAL )
+    if ( TickGet() - _tftpStartTick >= TFTP_GET_TIMEOUT_VAL )
     {
         bTimeOut = TRUE;
         _tftpStartTick = TickGet();
@@ -860,6 +1236,8 @@ TFTP_RESULT TFTPIsPutReady(void)
             else
             {
                 DEBUG(printf("TFTPIsPutReady(): Retry.\n"));
+                _tftpState = SM_TFTP_WAIT;
+                MutExVar.group2._tftpBlockNumber.Val--;	// Roll back by one so proper block number ID is sent for the next packet
                 return TFTP_RETRY;
             }
         }
@@ -956,6 +1334,12 @@ TFTP_RESULT TFTPIsPutReady(void)
         // is ready to transmit.
         if ( UDPIsPutReady(_tftpSocket) )
             return TFTP_OK;
+
+	// Suppress compiler warnings on unhandled SM_TFTP_WAIT_FOR_DATA, 
+	// SM_TFTP_DUPLICATE_ACK, SM_TFTP_SEND_ACK, SM_TFTP_SEND_LAST_ACK enum 
+	// states.
+    default:	
+    	break;
     }
 
     return TFTP_NOT_READY;
@@ -965,6 +1349,8 @@ TFTP_RESULT TFTPIsPutReady(void)
 
 /*********************************************************************
  * Function:        void TFTPPut(BYTE c)
+ *
+ * Summary:         Write a byte to a file.
  *
  * PreCondition:    TFTPOpenFile() is called with TFTP_FILE_MODE_WRITE
  *                  and TFTPIsPutReady() = TRUE
@@ -1014,6 +1400,9 @@ static void _TFTPSendFileName(TFTP_OPCODE opcode, BYTE *fileName)
 {
     BYTE c;
 
+	// Select the proper UDP socket and wait until we can write to it
+	while(!UDPIsPutReady(_tftpSocket));
+
     // Write opCode
     UDPPut(0);
     UDPPut(opcode);
@@ -1044,6 +1433,9 @@ static void _TFTPSendFileName(TFTP_OPCODE opcode, BYTE *fileName)
 static void _TFTPSendROMFileName(TFTP_OPCODE opcode, ROM BYTE *fileName)
 {
     BYTE c;
+
+	// Select the proper UDP socket and wait until we can write to it
+	while(!UDPIsPutReady(_tftpSocket));
 
     // Write opCode
     UDPPut(0);

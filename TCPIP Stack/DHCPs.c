@@ -68,9 +68,9 @@
 /// Ignore: #define DHCP_MAX_LEASES					2		// Not implemented
 
 // DHCP Control Block.  Lease IP address is derived from index into DCB array.
-typedef struct _DHCP_CONTROL_BLOCK
+typedef struct
 {
-	TICK 		LeaseExpires;	// Expiration time for this lease
+	DWORD 		LeaseExpires;	// Expiration time for this lease
 	MAC_ADDR	ClientMAC;		// Client's MAC address.  Multicase bit is used to determine if a lease is given out or not
 	enum 
 	{
@@ -135,7 +135,8 @@ void DHCPServerTask(void)
 	{
 		case DHCP_OPEN_SOCKET:
 			// Obtain a UDP socket to listen/transmit on
-			MySocket = UDPOpen(DHCP_SERVER_PORT, NULL, DHCP_CLIENT_PORT);
+			//MySocket = UDPOpen(DHCP_SERVER_PORT, NULL, DHCP_CLIENT_PORT);
+			MySocket = UDPOpenEx(0,UDP_OPEN_SERVER,DHCP_SERVER_PORT, DHCP_CLIENT_PORT);
 			if(MySocket == INVALID_UDP_SOCKET)
 				break;
 
@@ -326,12 +327,22 @@ static void DHCPReplyToDiscovery(BOOTP_HEADER *Header)
 	UDPPut(sizeof(IP_ADDR));
 	UDPPutArray((BYTE*)&AppConfig.MyIPAddr, sizeof(IP_ADDR));
 
+	// Option: DNS server address
+	UDPPut(DHCP_DNS);
+	UDPPut(sizeof(IP_ADDR));
+	UDPPutArray((BYTE*)&AppConfig.MyIPAddr, sizeof(IP_ADDR));
+
 	// No more options, mark ending
 	UDPPut(DHCP_END_OPTION);
 
 	// Add zero padding to ensure compatibility with old BOOTP relays that discard small packets (<300 UDP octets)
 	while(UDPTxCount < 300u)
 		UDPPut(0); 
+
+	// Force remote destination address to be the broadcast address, regardless 
+	// of what the node's source IP address was (to ensure we don't try to 
+	// unicast to 0.0.0.0).
+	memset((void*)&UDPSocketInfo[MySocket].remote.remoteNode, 0xFF, sizeof(NODE_INFO));
 
 	// Transmit the packet
 	UDPFlush();
@@ -469,12 +480,22 @@ static void DHCPReplyToRequest(BOOTP_HEADER *Header, BOOL bAccept)
 	UDPPut(sizeof(IP_ADDR));
 	UDPPutArray((BYTE*)&AppConfig.MyIPAddr, sizeof(IP_ADDR));
 
+	// Option: DNS server address
+	UDPPut(DHCP_DNS);
+	UDPPut(sizeof(IP_ADDR));
+	UDPPutArray((BYTE*)&AppConfig.MyIPAddr, sizeof(IP_ADDR));
+
 	// No more options, mark ending
 	UDPPut(DHCP_END_OPTION);
 
 	// Add zero padding to ensure compatibility with old BOOTP relays that discard small packets (<300 UDP octets)
 	while(UDPTxCount < 300u)
 		UDPPut(0); 
+
+	// Force remote destination address to be the broadcast address, regardless 
+	// of what the node's source IP address was (to ensure we don't try to 
+	// unicast to 0.0.0.0).
+	memset((void*)&UDPSocketInfo[MySocket].remote.remoteNode, 0xFF, sizeof(NODE_INFO));
 
 	// Transmit the packet
 	UDPFlush();

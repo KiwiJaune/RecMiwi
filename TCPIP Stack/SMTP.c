@@ -338,7 +338,7 @@ void SMTPTask(void)
 	BYTE			i;
 	WORD			w;
 	BYTE			vBase64Buffer[4];
-	static TICK		Timer;
+	static DWORD	Timer;
 	static BYTE		RXBuffer[4];
 	static ROM BYTE *ROMStrPtr, *ROMStrPtr2;
 	static BYTE 	*RAMStrPtr;

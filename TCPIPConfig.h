@@ -66,7 +66,7 @@
  *   disabled the following high-level application modules.
  */
 #define STACK_USE_UART					// Application demo using UART for IP address display and stack configuration
-#define STACK_USE_UART2TCP_BRIDGE		// UART to TCP Bridge application example
+//#define STACK_USE_UART2TCP_BRIDGE		// UART to TCP Bridge application example
 //#define STACK_USE_IP_GLEANING
 #define STACK_USE_ICMP_SERVER			// Ping query and response capability
 #define STACK_USE_ICMP_CLIENT			// Ping transmission capability
@@ -156,7 +156,7 @@
 #define MY_DEFAULT_MAC_BYTE3            (0xA3)	// an ENCX24J600 or ZeroG ZG2100
 #define MY_DEFAULT_MAC_BYTE4            (0x00)	// and wish to use the internal
 #define MY_DEFAULT_MAC_BYTE5            (0x00)	// factory programmed MAC
-#define MY_DEFAULT_MAC_BYTE6            (0xC2)	// address instead.
+#define MY_DEFAULT_MAC_BYTE6            (0x00)	// address instead.
 
 #define MY_DEFAULT_IP_ADDR_BYTE1        (10ul)
 #define MY_DEFAULT_IP_ADDR_BYTE2        (1ul)
@@ -171,12 +171,12 @@
 #define MY_DEFAULT_GATE_BYTE1           (10ul)
 #define MY_DEFAULT_GATE_BYTE2           (1ul)
 #define MY_DEFAULT_GATE_BYTE3           (0ul)
-#define MY_DEFAULT_GATE_BYTE4           (1ul)
+#define MY_DEFAULT_GATE_BYTE4           (2ul)
 
 #define MY_DEFAULT_PRIMARY_DNS_BYTE1	(10ul)
 #define MY_DEFAULT_PRIMARY_DNS_BYTE2	(1ul)
 #define MY_DEFAULT_PRIMARY_DNS_BYTE3	(0ul)
-#define MY_DEFAULT_PRIMARY_DNS_BYTE4	(1ul)
+#define MY_DEFAULT_PRIMARY_DNS_BYTE4	(2ul)
 
 #define MY_DEFAULT_SECONDARY_DNS_BYTE1	(0ul)
 #define MY_DEFAULT_SECONDARY_DNS_BYTE2	(0ul)
@@ -324,7 +324,7 @@
  *   mode.  In CLIENT mode, some functions specific to client operation
  *   are enabled.
  */
-#define STACK_CLIENT_MODE
+#define STACK_CLIENT_MODE	
 
 /* TCP Socket Memory Allocation
  *   TCP needs memory to buffer incoming and outgoing data.  The

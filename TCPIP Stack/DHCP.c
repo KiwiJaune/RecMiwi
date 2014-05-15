@@ -139,6 +139,10 @@ BOOL DHCPClientInitializedOnce = FALSE;
 static BYTE _DHCPReceive(void);
 static void _DHCPSend(BYTE messageType, BOOL bRenewing);
 
+#if defined (WF_CS_IO)
+extern void SignalDHCPSuccessful(void);
+extern void SetDhcpProgressState(void);
+#endif
 
 /*****************************************************************************
   Function:
@@ -479,7 +483,9 @@ void DHCPTask(void)
 			
 			case SM_DHCP_GET_SOCKET:
 				// Open a socket to send and receive broadcast messages on
-				DHCPClient.hDHCPSocket = UDPOpen(DHCP_CLIENT_PORT, NULL, DHCP_SERVER_PORT);
+				//DHCPClient.hDHCPSocket = UDPOpen(DHCP_CLIENT_PORT, NULL, DHCP_SERVER_PORT);
+				
+				DHCPClient.hDHCPSocket = UDPOpenEx(0,UDP_OPEN_SERVER,DHCP_CLIENT_PORT, DHCP_SERVER_PORT);
 				if(DHCPClient.hDHCPSocket == INVALID_UDP_SOCKET)
 					break;
 	
@@ -513,7 +519,7 @@ void DHCPTask(void)
 	
 				// Ensure that we transmit to the broadcast IP and MAC addresses
 				// The UDP Socket remembers who it was last talking to
-				memset((void*)&UDPSocketInfo[DHCPClient.hDHCPSocket].remoteNode, 0xFF, sizeof(UDPSocketInfo[0].remoteNode));
+				memset((void*)&UDPSocketInfo[DHCPClient.hDHCPSocket].remote.remoteNode, 0xFF, sizeof(UDPSocketInfo[0].remote.remoteNode));
 	
 				// Send the DHCP Discover broadcast
 				_DHCPSend(DHCP_DISCOVER_MESSAGE, FALSE);
@@ -553,7 +559,7 @@ void DHCPTask(void)
 				// we must set this back to the broadcast address since the 
 				// current socket values are the unicast addresses of the DHCP 
 				// server.
-				memset((void*)&UDPSocketInfo[DHCPClient.hDHCPSocket].remoteNode, 0xFF, sizeof(UDPSocketInfo[0].remoteNode));
+				memset((void*)&UDPSocketInfo[DHCPClient.hDHCPSocket].remote.remoteNode, 0xFF, sizeof(UDPSocketInfo[0].remote.remoteNode));
 	
 				// Send the DHCP request message
 				_DHCPSend(DHCP_REQUEST_MESSAGE, FALSE);
@@ -585,7 +591,17 @@ void DHCPTask(void)
 						DHCPClient.flags.bits.bIsBound = TRUE;	
 
 						if(DHCPClient.validValues.bits.IPAddress)
+						{
 							AppConfig.MyIPAddr = DHCPClient.tempIPAddress;
+							
+							#if defined(WF_CS_IO) 
+							    #if defined(STACK_USE_UART )
+							        putrsUART("DHCP client successful\r\n");
+							    #endif
+    							SignalDHCPSuccessful();
+							#endif
+							
+						}	
 						if(DHCPClient.validValues.bits.Mask)
 							AppConfig.MyMask = DHCPClient.tempMask;
 						if(DHCPClient.validValues.bits.Gateway)
@@ -622,7 +638,9 @@ void DHCPTask(void)
 				}
 	
 				// Open a socket to send and receive DHCP messages on
-				DHCPClient.hDHCPSocket = UDPOpen(DHCP_CLIENT_PORT, NULL, DHCP_SERVER_PORT);
+				//DHCPClient.hDHCPSocket = UDPOpen(DHCP_CLIENT_PORT, NULL, DHCP_SERVER_PORT);
+				
+				DHCPClient.hDHCPSocket = UDPOpenEx(0,UDP_OPEN_SERVER,DHCP_CLIENT_PORT, DHCP_SERVER_PORT);
 				if(DHCPClient.hDHCPSocket == INVALID_UDP_SOCKET)
 					break;
 	
@@ -634,7 +652,10 @@ void DHCPTask(void)
 			case SM_DHCP_SEND_RENEW3:
 				if(UDPIsPutReady(DHCPClient.hDHCPSocket) < 258u)
 					break;
-	
+
+                                #if defined(WF_CS_IO)
+                                    SetDhcpProgressState();
+                                #endif
 				// Send the DHCP request message
 				_DHCPSend(DHCP_REQUEST_MESSAGE, TRUE);
 				DHCPClient.flags.bits.bOfferReceived = FALSE;
@@ -739,7 +760,7 @@ static BYTE _DHCPReceive(void)
 	BYTE i, j;
 	BYTE type;
 	BOOL lbDone;
-	DWORD_VAL tempServerID;
+	DWORD tempServerID;
 
 
 	// Assume unknown message until proven otherwise.
@@ -750,29 +771,10 @@ static BYTE _DHCPReceive(void)
 	// Make sure this is BOOT_REPLY.
 	if ( v == BOOT_REPLY )
 	{
-		// Discard htype, hlen, hops, xid, secs, flags, ciaddr.
-		for ( i = 0; i < 15u; i++ )
-			UDPGet(&v);
-
-		// Check to see if this is the first offer
-		if(DHCPClient.flags.bits.bOfferReceived)
-		{
-			// Discard offered IP address, we already have an offer
-			for ( i = 0; i < 4u; i++ )
-				UDPGet(&v);
-		}
-		else
-		{
-			// Save offered IP address until we know for sure that we have it.
-			UDPGetArray((BYTE*)&DHCPClient.tempIPAddress, sizeof(DHCPClient.tempIPAddress));
-			DHCPClient.validValues.bits.IPAddress = 1;
-		}
-
-		// Ignore siaddr, giaddr
-		for ( i = 0; i < 8u; i++ )
-			UDPGet(&v);
-
-		// Check to see if chaddr (Client Hardware Address) belongs to us.
+		// Jump to chaddr field (Client Hardware Address -- our MAC address for 
+		// Ethernet and WiFi networks) and verify that this message is directed 
+		// to us before doing any other processing.
+		UDPSetRxBuffer(28);		// chaddr field is at offset 28 in the UDP packet payload -- see DHCP packet format above
 		for ( i = 0; i < 6u; i++ )
 		{
 			UDPGet(&v);
@@ -780,10 +782,20 @@ static BYTE _DHCPReceive(void)
 				goto UDPInvalid;
 		}
 
+		// Check to see if this is the first offer.  If it is, record its 
+		// yiaddr value ("Your (client) IP address") so that we can REQUEST to 
+		// use it later.
+		if(!DHCPClient.flags.bits.bOfferReceived)
+		{
+			UDPSetRxBuffer(16);
+			UDPGetArray((BYTE*)&DHCPClient.tempIPAddress, sizeof(DHCPClient.tempIPAddress));
+			DHCPClient.validValues.bits.IPAddress = 1;
+		}
 
-		// Ignore part of chaddr, sname, file, magic cookie.
-		for ( i = 0; i < 206u; i++ )
-			UDPGet(&v);
+		// Jump to DHCP options (ignore htype, hlen, hops, xid, secs, flags, 
+		// ciaddr, siaddr, giaddr, padding part of chaddr, sname, file, magic 
+		// cookie fields)
+		UDPSetRxBuffer(240);
 
 		lbDone = FALSE;
 		do
@@ -931,10 +943,10 @@ static BYTE _DHCPReceive(void)
 					// Len must be 4.
 					if ( v == 4u )
 					{
-						UDPGet(&tempServerID.v[3]);   // Get the id
-						UDPGet(&tempServerID.v[2]);
-						UDPGet(&tempServerID.v[1]);
-						UDPGet(&tempServerID.v[0]);
+						UDPGet(&(((BYTE*)&tempServerID)[3]));   // Get the id
+						UDPGet(&(((BYTE*)&tempServerID)[2]));
+						UDPGet(&(((BYTE*)&tempServerID)[1]));
+						UDPGet(&(((BYTE*)&tempServerID)[0]));
 					}
 					else
 						goto UDPInvalid;
@@ -985,14 +997,14 @@ static BYTE _DHCPReceive(void)
 	// If this is an OFFER message, remember current server id.
 	if ( type == DHCP_OFFER_MESSAGE )
 	{
-		DHCPClient.dwServerID = tempServerID.Val;
+		DHCPClient.dwServerID = tempServerID;
 		DHCPClient.flags.bits.bOfferReceived = TRUE;
 	}
 	else
 	{
 		// For other types of messages, make sure that received
 		// server id matches with our previous one.
-		if ( DHCPClient.dwServerID != tempServerID.Val )
+		if ( DHCPClient.dwServerID != tempServerID )
 			type = DHCP_UNKNOWN_MESSAGE;
 	}
 
@@ -1002,7 +1014,6 @@ static BYTE _DHCPReceive(void)
 UDPInvalid:
 	UDPDiscard();
 	return DHCP_UNKNOWN_MESSAGE;
-
 }
 
 
@@ -1130,7 +1141,7 @@ static void _DHCPSend(BYTE messageType, BOOL bRenewing)
 	while(UDPTxCount < 300u)
 		UDPPut(0); 
 
-	// Make sure we advirtise a 0.0.0.0 IP address so all DHCP servers will respond.  If we have a static IP outside the DHCP server's scope, it may simply ignore discover messages.
+	// Make sure we advertise a 0.0.0.0 IP address so all DHCP servers will respond.  If we have a static IP outside the DHCP server's scope, it may simply ignore discover messages.
 	MyIP.Val = AppConfig.MyIPAddr.Val;
 	if(!bRenewing)
 		AppConfig.MyIPAddr.Val = 0x00000000;
