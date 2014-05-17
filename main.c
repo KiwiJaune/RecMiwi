@@ -89,7 +89,7 @@ int main(int argc, char** argv)
 		if(MiwiIsDataReady())
 		{
 			//Recupere la trame Miwi et envoi en UDP 
-			//EnvoiUserUdp(MiwiGetData());
+			EnvoiUserUdp(MiwiGetData());
 			trameRecuMiwi = MiwiGetData();
 		}
 		//--Acquittement des msgs bloquant vers PC
