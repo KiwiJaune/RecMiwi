@@ -14,6 +14,8 @@ void AnalyseTrameUdp(Trame trame)
 			//Type : Bloquant ou Buffer
 			typeMessage = trame.message[2];
 			destinataire = trame.message[3];
+			if(destinataire == 0xC3)
+				destinataire = 0xC5; // Renvoi vers RecPiMiwi pour les message en destination de RecPi (lololol)
 			//Envoi miwi de la trame recu qui suit
 			//les 2 premiers octects
 			trame.message = &trame.message[3];
