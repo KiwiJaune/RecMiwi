@@ -97,6 +97,9 @@ int main(int argc, char** argv)
 
 		if(expediteurAck)
 		{
+			// C5 est l'intermédiaire vers le petit robot
+			if(expediteurAck == 0xC5)
+				expediteurAck = 0xC3;
 			trameAckUdp.message[2] = expediteurAck;
 			delay(100);
 			EnvoiUserUdp(trameAckUdp);
